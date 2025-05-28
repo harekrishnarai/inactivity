@@ -1,10 +1,9 @@
 package main
 
 import (
-	"os"
+	"github.com/harekrishnarai/inactivity/cmd"
 )
 
 func main() {
-	main.Main()
-	os.Exit(0)
+	cmd.Main()
 }
