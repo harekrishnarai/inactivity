@@ -18,3 +18,4 @@ inactivity
 *.vscode/
 # Ignore system files
 .DS_Store
+*.csv

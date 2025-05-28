@@ -35,32 +35,52 @@ func main() {
 	commonFlags.Float64Var(&cfg.InactiveContribThreshold, "threshold", 0.5, "Threshold of inactive contributors (0.0-1.0)")
 	commonFlags.StringVar(&cfg.OutputFormat, "format", "console", "Output format: console, json, or csv")
 	commonFlags.StringVar(&cfg.OutputFile, "output", "", "Output file path (optional)")
-	commonFlags.BoolVar(&cfg.Silent, "silent", false, "Suppress banner and progress output")
-
-	// Process command
+	commonFlags.BoolVar(&cfg.Silent, "silent", false, "Suppress banner and progress output") // Process command
 	switch os.Args[1] {
 	case "org":
 		// The original functionality: analyze an organization's repositories
 		orgCmd := flag.NewFlagSet("org", flag.ExitOnError)
-		orgCmd.StringVar(&cfg.Organization, "name", "", "GitHub organization to analyze")
+		orgCmd.StringVar(&cfg.Organization, "org", "", "GitHub organization to analyze")
 
-		// Parse organization command flags
-		err := orgCmd.Parse(os.Args[2:])
-		if err != nil {
+		// Add common flags to org command
+		orgCmd.IntVar(&cfg.MaxCommitAgeInDays, "days", 180, "Maximum age of last commit in days")
+		orgCmd.Float64Var(&cfg.InactiveContribThreshold, "threshold", 0.5, "Threshold of inactive contributors (0.0-1.0)")
+		orgCmd.StringVar(&cfg.OutputFormat, "format", "console", "Output format: console, json, or csv")
+		orgCmd.StringVar(&cfg.OutputFile, "output", "", "Output file path (optional)")
+		orgCmd.BoolVar(&cfg.Silent, "silent", false, "Suppress banner and progress output") // Parse org command flags only once
+		if err := orgCmd.Parse(os.Args[2:]); err != nil {
 			log.Fatalf("❌ Failed to parse org command flags: %v", err)
 		}
 
-		// Copy common flags to organization command
-		commonFlags.VisitAll(func(f *flag.Flag) {
-			if og := orgCmd.Lookup(f.Name); og == nil {
-				orgCmd.Var(f.Value, f.Name, f.Usage)
+		// Check for positional arguments
+		if orgCmd.NArg() > 0 {
+			// Print debug info about positional arguments
+			fmt.Printf("Debug: Found %d positional arguments: ", orgCmd.NArg())
+			for i := 0; i < orgCmd.NArg(); i++ {
+				fmt.Printf("%s ", orgCmd.Arg(i))
 			}
-		})
+			fmt.Println()
 
-		// Parse org command with common flags
-		if err := orgCmd.Parse(os.Args[2:]); err != nil {
-			log.Fatalf("❌ Error parsing command flags: %v", err)
+			// First positional argument could be the format
+			if orgCmd.NArg() >= 1 {
+				if orgCmd.Arg(0) == "json" || orgCmd.Arg(0) == "csv" || orgCmd.Arg(0) == "console" {
+					cfg.OutputFormat = orgCmd.Arg(0)
+					fmt.Printf("Debug: Setting output format to %s from positional argument\n", cfg.OutputFormat)
+				}
+			}
+
+			// Check for output as a separate positional argument
+			for i := 0; i < orgCmd.NArg(); i++ {
+				if orgCmd.Arg(i) == "-output" && i+1 < orgCmd.NArg() {
+					cfg.OutputFile = orgCmd.Arg(i + 1)
+					fmt.Printf("Debug: Setting output file to %s from positional arguments\n", cfg.OutputFile)
+					break
+				}
+			}
 		}
+
+		// Debug output to verify configuration
+		fmt.Printf("Debug: Final configuration - OutputFormat=%s, OutputFile=%s\n", cfg.OutputFormat, cfg.OutputFile)
 
 		// Run the organization analysis
 		analyzeOrganization(cfg)
@@ -78,13 +98,8 @@ func main() {
 
 		// Set the repository name
 		cfg.SingleRepository = os.Args[2]
-
 		// Parse remaining flags
 		if len(os.Args) > 3 {
-			if err := repoCmd.Parse(os.Args[3:]); err != nil {
-				log.Fatalf("❌ Error parsing repo command flags: %v", err)
-			}
-
 			// Copy common flags to repo command
 			commonFlags.VisitAll(func(f *flag.Flag) {
 				if rg := repoCmd.Lookup(f.Name); rg == nil {
@@ -95,6 +110,11 @@ func main() {
 			// Parse repo command with common flags
 			if err := repoCmd.Parse(os.Args[3:]); err != nil {
 				log.Fatalf("❌ Error parsing command flags: %v", err)
+			}
+
+			// Check for format as a positional argument (for backward compatibility)
+			if repoCmd.NArg() >= 1 && (repoCmd.Arg(0) == "json" || repoCmd.Arg(0) == "csv" || repoCmd.Arg(0) == "console") {
+				cfg.OutputFormat = repoCmd.Arg(0)
 			}
 		}
 
@@ -114,13 +134,8 @@ func main() {
 
 		// Set the repository list file path
 		cfg.RepoListFile = os.Args[2]
-
 		// Parse remaining flags
 		if len(os.Args) > 3 {
-			if err := fileCmd.Parse(os.Args[3:]); err != nil {
-				log.Fatalf("❌ Error parsing file command flags: %v", err)
-			}
-
 			// Copy common flags to file command
 			commonFlags.VisitAll(func(f *flag.Flag) {
 				if fg := fileCmd.Lookup(f.Name); fg == nil {
@@ -131,6 +146,11 @@ func main() {
 			// Parse file command with common flags
 			if err := fileCmd.Parse(os.Args[3:]); err != nil {
 				log.Fatalf("❌ Error parsing command flags: %v", err)
+			}
+
+			// Check for format as a positional argument (for backward compatibility)
+			if fileCmd.NArg() >= 1 && (fileCmd.Arg(0) == "json" || fileCmd.Arg(0) == "csv" || fileCmd.Arg(0) == "console") {
+				cfg.OutputFormat = fileCmd.Arg(0)
 			}
 		}
 
@@ -175,7 +195,7 @@ func displayUsage() {
 	fmt.Printf("%s\n", yellow("Options:"))
 	fmt.Printf("  %s\t%s\n", green("-days int"), "Maximum age of last commit in days (default: 180)")
 	fmt.Printf("  %s\t%s\n", green("-threshold float"), "Threshold of inactive contributors (0.0-1.0) (default: 0.5)")
-	fmt.Printf("  %s\t%s\n", green("format string"), "Output format: console, json, or csv (default: console)")
+	fmt.Printf("  %s\t%s\n", green("-format string"), "Output format: console, json, or csv (default: console)")
 	fmt.Printf("  %s\t%s\n", green("-output string"), "Output file path (optional)")
 	fmt.Printf("  %s\t%s\n", green("-silent"), "Suppress banner and progress output")
 	fmt.Printf("  %s\t%s\n\n", green("-org string"), "GitHub organization to analyze (for 'org' command)")
@@ -183,9 +203,10 @@ func displayUsage() {
 	fmt.Printf("%s\n", yellow("Examples:"))
 	fmt.Printf("  %s\n", green("inactivity org -org mycompany"))
 	fmt.Printf("  %s\n", green("inactivity repo mycompany/myrepo -days 90"))
-	fmt.Printf("  %s\n", green("inactivity file repos.txt format csv -output results.csv"))
-	fmt.Printf("  %s\n", green("inactivity org -org mycompany format json -output results.json"))
-	fmt.Printf("  %s\n\n", green("inactivity repo mycompany/myrepo format csv -output repo-result.csv"))
+	fmt.Printf("  %s\n", green("inactivity file repos.txt -format csv -output results.csv"))
+	fmt.Printf("  %s\n", green("inactivity org -org mycompany -format json -output results.json"))
+	fmt.Printf("  %s\n", green("inactivity repo mycompany/myrepo -format csv -output repo-result.csv"))
+	fmt.Printf("  %s\n\n", green("inactivity org format csv -output results.csv  # Alternative format syntax"))
 }
 
 // analyzeOrganization analyzes all repositories in an organization
