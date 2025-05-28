@@ -15,7 +15,9 @@ import (
 	"github.com/harekrishnarai/inactivity/pkg/config"
 )
 
-func main() {
+// Main is the entry point for the application
+// It's exported so it can be called from the root package
+func Main() {
 	// Check if any command line arguments are provided
 	if len(os.Args) < 2 {
 		displayUsage()
