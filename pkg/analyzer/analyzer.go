@@ -22,6 +22,7 @@ type Repository struct {
 	TotalContributors    int       `json:"totalContributors"`
 	InactiveContributors int       `json:"inactiveContributors"`
 	InactivePercentage   float64   `json:"inactivePercentage"`
+	Archived             bool      `json:"archived"`
 	Flagged              bool      `json:"flagged"`
 }
 
@@ -207,6 +208,15 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		r := Repository{
 			Name: repoFullName,
 		}
+		// Check if repository is archived
+		isArchived, err := isRepositoryArchived(repoFullName)
+		if err != nil {
+			if !cfg.Silent {
+				fmt.Printf("⚠️ Warning: Failed to check if repository is archived for %s: %v\n", repoFullName, err)
+			}
+			continue
+		}
+		r.Archived = isArchived
 
 		// Get last commit date
 		lastCommitDate, err := getLastCommitDate(repoFullName)
@@ -236,17 +246,26 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		}
 
 		// Flag repository based on criteria
-		isOld := r.DaysSinceLastCommit > cfg.MaxCommitAgeInDays
+		// 1. Repositories are flagged if they are archived
+		// 2. Repositories are flagged if they meet the age and inactive contributor criteria
 
-		if isOld {
-			if r.TotalContributors > 0 {
-				// If there are contributors, flag if the inactive percentage meets the threshold
-				if r.InactivePercentage >= cfg.InactiveContribThreshold {
+		// Always flag archived repositories
+		if r.Archived {
+			r.Flagged = true
+		} else {
+			// For non-archived repos, check age and contributor criteria
+			isOld := r.DaysSinceLastCommit > cfg.MaxCommitAgeInDays
+
+			if isOld {
+				if r.TotalContributors > 0 {
+					// If there are contributors, flag if the inactive percentage meets the threshold
+					if r.InactivePercentage >= cfg.InactiveContribThreshold {
+						r.Flagged = true
+					}
+				} else {
+					// If there are no contributors, flag it simply for being old
 					r.Flagged = true
 				}
-			} else {
-				// If there are no contributors, flag it simply for being old
-				r.Flagged = true
 			}
 		}
 
@@ -400,17 +419,18 @@ func OutputResults(repos []Repository, cfg config.Config) error {
 		var csvBuffer bytes.Buffer
 
 		// Write CSV header
-		csvBuffer.WriteString("Repository Name,Last Commit Date,Days Since Last Commit,Total Contributors,Inactive Contributors,Inactive Percentage,Flagged\n")
+		csvBuffer.WriteString("Repository Name,Last Commit Date,Days Since Last Commit,Total Contributors,Inactive Contributors,Inactive Percentage,Archived,Flagged\n")
 
 		// Write repository data
 		for _, repo := range repos {
-			csvBuffer.WriteString(fmt.Sprintf("%s,%s,%d,%d,%d,%.2f,%t\n",
+			csvBuffer.WriteString(fmt.Sprintf("%s,%s,%d,%d,%d,%.2f,%t,%t\n",
 				repo.Name,
 				repo.LastCommitDate.Format("2006-01-02"),
 				repo.DaysSinceLastCommit,
 				repo.TotalContributors,
 				repo.InactiveContributors,
 				repo.InactivePercentage*100,
+				repo.Archived,
 				repo.Flagged))
 		}
 
@@ -441,9 +461,14 @@ func OutputResults(repos []Repository, cfg config.Config) error {
 					fmt.Printf("- %s\n", repo.Name)
 					fmt.Printf("  Last commit: %s (%d days ago)\n",
 						repo.LastCommitDate.Format("2006-01-02"), repo.DaysSinceLastCommit)
-					fmt.Printf("  Contributors: %d total, %d inactive (%.1f%%)\n\n",
+					fmt.Printf("  Contributors: %d total, %d inactive (%.1f%%)\n",
 						repo.TotalContributors, repo.InactiveContributors,
 						repo.InactivePercentage*100)
+					if repo.Archived {
+						fmt.Printf("  📦 Repository Status: Archived\n\n")
+					} else {
+						fmt.Printf("  📦 Repository Status: Not Archived\n\n")
+					}
 				}
 			}
 		}
@@ -464,9 +489,14 @@ func OutputResults(repos []Repository, cfg config.Config) error {
 						reportBuf.WriteString(fmt.Sprintf("- %s\n", repo.Name))
 						reportBuf.WriteString(fmt.Sprintf("  Last commit: %s (%d days ago)\n",
 							repo.LastCommitDate.Format("2006-01-02"), repo.DaysSinceLastCommit))
-						reportBuf.WriteString(fmt.Sprintf("  Contributors: %d total, %d inactive (%.1f%%)\n\n",
+						reportBuf.WriteString(fmt.Sprintf("  Contributors: %d total, %d inactive (%.1f%%)\n",
 							repo.TotalContributors, repo.InactiveContributors,
 							repo.InactivePercentage*100))
+						if repo.Archived {
+							reportBuf.WriteString("  Repository Status: Archived\n\n")
+						} else {
+							reportBuf.WriteString("  Repository Status: Not Archived\n\n")
+						}
 					}
 				}
 			}
@@ -503,16 +533,17 @@ func OutputSingleRepositoryResult(repo Repository, cfg config.Config) error {
 		var csvBuffer bytes.Buffer
 
 		// Write CSV header
-		csvBuffer.WriteString("Repository Name,Last Commit Date,Days Since Last Commit,Total Contributors,Inactive Contributors,Inactive Percentage,Flagged\n")
+		csvBuffer.WriteString("Repository Name,Last Commit Date,Days Since Last Commit,Total Contributors,Inactive Contributors,Inactive Percentage,Archived,Flagged\n")
 
 		// Write repository data
-		csvBuffer.WriteString(fmt.Sprintf("%s,%s,%d,%d,%d,%.2f,%t\n",
+		csvBuffer.WriteString(fmt.Sprintf("%s,%s,%d,%d,%d,%.2f,%t,%t\n",
 			repo.Name,
 			repo.LastCommitDate.Format("2006-01-02"),
 			repo.DaysSinceLastCommit,
 			repo.TotalContributors,
 			repo.InactiveContributors,
 			repo.InactivePercentage*100,
+			repo.Archived,
 			repo.Flagged))
 
 		if cfg.OutputFile != "" {
@@ -532,6 +563,12 @@ func OutputSingleRepositoryResult(repo Repository, cfg config.Config) error {
 			repo.TotalContributors, repo.InactiveContributors,
 			repo.InactivePercentage*100)
 
+		if repo.Archived {
+			fmt.Println("📦 Repository Status: Archived")
+		} else {
+			fmt.Println("📦 Repository Status: Active (Not Archived)")
+		}
+
 		if repo.Flagged {
 			fmt.Println("🚩 Status: Flagged as inactive")
 		} else {
@@ -549,6 +586,12 @@ func OutputSingleRepositoryResult(repo Repository, cfg config.Config) error {
 				repo.TotalContributors, repo.InactiveContributors,
 				repo.InactivePercentage*100))
 
+			if repo.Archived {
+				reportBuf.WriteString("Repository Status: Archived\n")
+			} else {
+				reportBuf.WriteString("Repository Status: Not Archived\n")
+			}
+
 			if repo.Flagged {
 				reportBuf.WriteString("Status: Flagged as inactive\n")
 			} else {
@@ -565,82 +608,35 @@ func OutputSingleRepositoryResult(repo Repository, cfg config.Config) error {
 	return nil
 }
 
-// getLastCommitDate retrieves the date of the last commit for a repository (unexported version for internal use)
-func getLastCommitDate(repoFullName string) (time.Time, error) {
-	// Delegate to the exported version
-	return GetLastCommitDate(repoFullName)
-}
+// isRepositoryArchived is defined in archive.go
 
-// getContributorsStatus checks how many contributors are still active in the organization (unexported version for internal use)
-func getContributorsStatus(repoFullName, orgName string) (active, inactive int, err error) {
-	// Delegate to the exported version
-	return GetContributorsStatus(repoFullName, orgName)
-}
-
-// AnalyzeSingleRepository analyzes a single repository
-func AnalyzeSingleRepository(cfg config.Config) (Repository, error) {
-	repoFullName := cfg.SingleRepository
-	r := Repository{
-		Name: repoFullName,
-	}
-
-	// Validate repository exists and is accessible
+// GetRepositoryDetails retrieves various details for a repository
+func GetRepositoryDetails(repoFullName string) (time.Time, bool, error) {
 	cmd := exec.Command("gh", "api",
 		fmt.Sprintf("repos/%s", repoFullName),
-		"--silent")
+		"--jq", "{archived: .archived, updated_at: .updated_at}")
 
-	if err := cmd.Run(); err != nil {
-		return r, fmt.Errorf("repository %s not found or not accessible: %w", repoFullName, err)
-	}
+	var out bytes.Buffer
+	cmd.Stdout = &out
 
-	if !cfg.Silent {
-		fmt.Printf("🔍 Analyzing repository: %s\n", repoFullName)
-	}
-
-	// Get organization name from full repository name
-	parts := strings.Split(repoFullName, "/")
-	if len(parts) != 2 {
-		return r, fmt.Errorf("invalid repository name format. Expected 'org/repo'")
-	}
-	orgName := parts[0]
-
-	now := time.Now()
-
-	// Get last commit date
-	lastCommitDate, err := getLastCommitDate(repoFullName)
+	err := cmd.Run()
 	if err != nil {
-		return r, fmt.Errorf("failed to get last commit date: %w", err)
+		return time.Time{}, false, fmt.Errorf("failed to get repository details: %w", err)
 	}
-	r.LastCommitDate = lastCommitDate
-	r.DaysSinceLastCommit = int(now.Sub(lastCommitDate).Hours() / 24)
 
-	// Get contributors and check if they are still in the organization
-	activeContribs, inactiveContribs, err := getContributorsStatus(repoFullName, orgName)
+	var result struct {
+		Archived  bool   `json:"archived"`
+		UpdatedAt string `json:"updated_at"`
+	}
+
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		return time.Time{}, false, fmt.Errorf("failed to parse repository details: %w", err)
+	}
+
+	updatedAt, err := time.Parse(time.RFC3339, result.UpdatedAt)
 	if err != nil {
-		return r, fmt.Errorf("failed to analyze contributors: %w", err)
+		return time.Time{}, result.Archived, fmt.Errorf("failed to parse updated_at time: %w", err)
 	}
 
-	r.TotalContributors = activeContribs + inactiveContribs
-	r.InactiveContributors = inactiveContribs
-
-	if r.TotalContributors > 0 {
-		r.InactivePercentage = float64(inactiveContribs) / float64(r.TotalContributors)
-	}
-
-	// Flag repository based on criteria
-	isOld := r.DaysSinceLastCommit > cfg.MaxCommitAgeInDays
-
-	if isOld {
-		if r.TotalContributors > 0 {
-			// If there are contributors, flag if the inactive percentage meets the threshold
-			if r.InactivePercentage >= cfg.InactiveContribThreshold {
-				r.Flagged = true
-			}
-		} else {
-			// If there are no contributors, flag it simply for being old
-			r.Flagged = true
-		}
-	}
-
-	return r, nil
+	return updatedAt, result.Archived, nil
 }

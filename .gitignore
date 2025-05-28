@@ -19,3 +19,4 @@ inactivity
 # Ignore system files
 .DS_Store
 *.csv
+*.json

@@ -398,9 +398,16 @@ func analyzeSingleRepository(cfg config.Config) { // Display banner unless silen
 	if err := cmd.Run(); err != nil {
 		log.Fatalf("❌ Repository %s not found or not accessible: %v", repoFullName, err)
 	}
-
 	// Get organization name from full repository name
 	orgName := parts[0]
+
+	// Check if repository is archived
+	isArchived, err := analyzer.IsRepositoryArchived(repoFullName)
+	if err != nil {
+		log.Printf("⚠️ Warning: Failed to check if repository is archived: %v", err)
+	} else {
+		repo.Archived = isArchived
+	}
 
 	// Get last commit date
 	lastCommitDate, err := analyzer.GetLastCommitDate(repoFullName)
