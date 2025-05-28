@@ -51,21 +51,12 @@ func main() {
 		if err := orgCmd.Parse(os.Args[2:]); err != nil {
 			log.Fatalf("❌ Failed to parse org command flags: %v", err)
 		}
-
 		// Check for positional arguments
 		if orgCmd.NArg() > 0 {
-			// Print debug info about positional arguments
-			fmt.Printf("Debug: Found %d positional arguments: ", orgCmd.NArg())
-			for i := 0; i < orgCmd.NArg(); i++ {
-				fmt.Printf("%s ", orgCmd.Arg(i))
-			}
-			fmt.Println()
-
 			// First positional argument could be the format
 			if orgCmd.NArg() >= 1 {
 				if orgCmd.Arg(0) == "json" || orgCmd.Arg(0) == "csv" || orgCmd.Arg(0) == "console" {
 					cfg.OutputFormat = orgCmd.Arg(0)
-					fmt.Printf("Debug: Setting output format to %s from positional argument\n", cfg.OutputFormat)
 				}
 			}
 
@@ -73,14 +64,10 @@ func main() {
 			for i := 0; i < orgCmd.NArg(); i++ {
 				if orgCmd.Arg(i) == "-output" && i+1 < orgCmd.NArg() {
 					cfg.OutputFile = orgCmd.Arg(i + 1)
-					fmt.Printf("Debug: Setting output file to %s from positional arguments\n", cfg.OutputFile)
 					break
 				}
 			}
 		}
-
-		// Debug output to verify configuration
-		fmt.Printf("Debug: Final configuration - OutputFormat=%s, OutputFile=%s\n", cfg.OutputFormat, cfg.OutputFile)
 
 		// Run the organization analysis
 		analyzeOrganization(cfg)
@@ -110,11 +97,19 @@ func main() {
 			// Parse repo command with common flags
 			if err := repoCmd.Parse(os.Args[3:]); err != nil {
 				log.Fatalf("❌ Error parsing command flags: %v", err)
+			} // Check for format as a positional argument
+			if repoCmd.NArg() >= 1 {
+				if repoCmd.Arg(0) == "json" || repoCmd.Arg(0) == "csv" || repoCmd.Arg(0) == "console" {
+					cfg.OutputFormat = repoCmd.Arg(0)
+				}
 			}
 
-			// Check for format as a positional argument (for backward compatibility)
-			if repoCmd.NArg() >= 1 && (repoCmd.Arg(0) == "json" || repoCmd.Arg(0) == "csv" || repoCmd.Arg(0) == "console") {
-				cfg.OutputFormat = repoCmd.Arg(0)
+			// Check for output as a separate positional argument
+			for i := 0; i < repoCmd.NArg(); i++ {
+				if repoCmd.Arg(i) == "-output" && i+1 < repoCmd.NArg() {
+					cfg.OutputFile = repoCmd.Arg(i + 1)
+					break
+				}
 			}
 		}
 
@@ -146,11 +141,19 @@ func main() {
 			// Parse file command with common flags
 			if err := fileCmd.Parse(os.Args[3:]); err != nil {
 				log.Fatalf("❌ Error parsing command flags: %v", err)
+			} // Check for format as a positional argument
+			if fileCmd.NArg() >= 1 {
+				if fileCmd.Arg(0) == "json" || fileCmd.Arg(0) == "csv" || fileCmd.Arg(0) == "console" {
+					cfg.OutputFormat = fileCmd.Arg(0)
+				}
 			}
 
-			// Check for format as a positional argument (for backward compatibility)
-			if fileCmd.NArg() >= 1 && (fileCmd.Arg(0) == "json" || fileCmd.Arg(0) == "csv" || fileCmd.Arg(0) == "console") {
-				cfg.OutputFormat = fileCmd.Arg(0)
+			// Check for output as a separate positional argument
+			for i := 0; i < fileCmd.NArg(); i++ {
+				if fileCmd.Arg(i) == "-output" && i+1 < fileCmd.NArg() {
+					cfg.OutputFile = fileCmd.Arg(i + 1)
+					break
+				}
 			}
 		}
 
@@ -182,6 +185,7 @@ func displayUsage() {
 	fmt.Printf("\n%s\n\n", cyan("Repository Inactivity Analyzer"))
 	fmt.Printf("%s\n", yellow("Usage:"))
 	fmt.Printf("  %s\n", green("inactivity org [options]"))
+	fmt.Printf("  %s\n", green("inactivity org [format] [options]  # Alternative syntax"))
 	fmt.Printf("  %s\n", green("inactivity repo <org/repo-name> [options]"))
 	fmt.Printf("  %s\n", green("inactivity file <file-path> [options]"))
 	fmt.Printf("  %s\n\n", green("inactivity help"))
@@ -191,6 +195,11 @@ func displayUsage() {
 	fmt.Printf("  %s\t%s\n", green("repo"), "Analyze a single repository")
 	fmt.Printf("  %s\t%s\n", green("file"), "Analyze repositories from a file")
 	fmt.Printf("  %s\t%s\n\n", green("help"), "Show this help message")
+
+	fmt.Printf("%s\n", yellow("Output Formats:"))
+	fmt.Printf("  %s\t%s\n", green("console"), "Display results in human-readable format (default)")
+	fmt.Printf("  %s\t%s\n", green("json"), "Output results in JSON format")
+	fmt.Printf("  %s\t%s\n\n", green("csv"), "Output results in CSV format")
 
 	fmt.Printf("%s\n", yellow("Options:"))
 	fmt.Printf("  %s\t%s\n", green("-days int"), "Maximum age of last commit in days (default: 180)")
@@ -206,7 +215,7 @@ func displayUsage() {
 	fmt.Printf("  %s\n", green("inactivity file repos.txt -format csv -output results.csv"))
 	fmt.Printf("  %s\n", green("inactivity org -org mycompany -format json -output results.json"))
 	fmt.Printf("  %s\n", green("inactivity repo mycompany/myrepo -format csv -output repo-result.csv"))
-	fmt.Printf("  %s\n\n", green("inactivity org format csv -output results.csv  # Alternative format syntax"))
+	fmt.Printf("  %s\n\n", green("inactivity org csv -output results.csv  # Alternative format syntax"))
 }
 
 // analyzeOrganization analyzes all repositories in an organization
