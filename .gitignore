@@ -1,0 +1,20 @@
+inactivity.exe
+inactivity
+# Ignore the executable and any other build artifacts
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+# Ignore temporary files
+*.tmp
+# Ignore log files
+*.log
+# Ignore backup files
+*.bak
+# Ignore configuration files
+*.conf
+# Ignore IDE specific files
+*.vscode/
+# Ignore system files
+.DS_Store
