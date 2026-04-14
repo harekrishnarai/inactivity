@@ -2,6 +2,7 @@ package analyzer
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -113,9 +114,7 @@ func DisplayBanner(silent bool, showOrgBanner bool) {
 func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 	// Use pagination to get all repositories in the organization
 	// We'll start with a higher limit and implement pagination logic
-	var allRepos []struct {
-		Name string `json:"name"`
-	}
+	var allRepos []string
 
 	page := 1
 	perPage := 100 // GitHub API typically uses 100 as maximum per page
@@ -148,9 +147,7 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		// Add repos to our collection
 		for _, name := range repoNames {
 			if name != "" { // Skip empty lines
-				allRepos = append(allRepos, struct {
-					Name string `json:"name"`
-				}{Name: name})
+				allRepos = append(allRepos, name)
 			}
 		}
 
@@ -169,6 +166,7 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 	var results []Repository
 	now := time.Now()
 	cache := NewCacheStore(cfg.CacheDir, cfg.RepoCacheTTL, cfg.MembershipCacheTTL)
+	checkpointStore := NewCheckpointStore(cfg.CheckpointDir)
 	startTime := time.Now()
 	progressState := ProgressState{
 		Mode:           "org",
@@ -178,6 +176,61 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		RateLimitFloor: cfg.RateLimitFloor,
 		TotalRepos:     len(allRepos),
 		Phase:          "scan",
+	}
+	pendingRepos := append([]string(nil), allRepos...)
+	currentCheckpoint := Checkpoint{
+		RunID:     fmt.Sprintf("run-%d", now.UTC().UnixNano()),
+		Target:    cfg.Organization,
+		StartedAt: now.UTC(),
+		UpdatedAt: now.UTC(),
+		Pending:   append([]string(nil), pendingRepos...),
+		Completed: map[string]RepoSnapshot{},
+		Failed:    map[string]string{},
+		Progress:  progressState,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopSignals := watchInterrupts(cancel)
+	defer stopSignals()
+
+	if cfg.Resume {
+		if checkpoint, err := checkpointStore.LoadLatest(cfg.Organization); err == nil {
+			pendingRepos = resumePendingRepos(allRepos, checkpoint)
+			currentCheckpoint = checkpoint
+			if currentCheckpoint.RunID == "" {
+				currentCheckpoint.RunID = fmt.Sprintf("run-%d", now.UTC().UnixNano())
+			}
+			if currentCheckpoint.StartedAt.IsZero() {
+				currentCheckpoint.StartedAt = now.UTC()
+			}
+			currentCheckpoint.Target = cfg.Organization
+			currentCheckpoint.Pending = append([]string(nil), pendingRepos...)
+			currentCheckpoint.InProgress = nil
+			if currentCheckpoint.Completed == nil {
+				currentCheckpoint.Completed = map[string]RepoSnapshot{}
+			}
+			if currentCheckpoint.Failed == nil {
+				currentCheckpoint.Failed = map[string]string{}
+			}
+			results = append(results, completedRepositories(checkpoint, allRepos)...)
+			progressState.CompletedRepos = len(results)
+			progressState.FailedRepos = len(checkpointFailures(checkpoint, allRepos))
+			currentCheckpoint.Progress = progressState
+		}
+	}
+
+	saveCheckpoint := func(onShutdown bool) error {
+		currentCheckpoint.Progress = progressState
+		currentCheckpoint.UpdatedAt = time.Now().UTC()
+		if err := checkpointStore.Save(currentCheckpoint); err != nil {
+			if onShutdown {
+				return fmt.Errorf("save checkpoint on shutdown: %w", err)
+			}
+			if !cfg.Silent {
+				fmt.Printf("⚠️ Warning: Failed to save checkpoint for %s: %v\n", cfg.Organization, err)
+			}
+		}
+		return nil
 	}
 
 	if !cfg.Silent {
@@ -213,6 +266,12 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 			}),
 		)
 	}
+	if !cfg.Silent && bar != nil && len(results) > 0 {
+		_ = bar.Add(len(results))
+	}
+	if err := saveCheckpoint(false); err != nil {
+		return nil, err
+	}
 
 	advanceProgress := func(i int) {
 		if cfg.Silent || bar == nil {
@@ -232,11 +291,25 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 	}
 
 	// Analyze each repository
-	for i, repo := range allRepos {
-		progressState.CompletedRepos = i + 1
+	for i, repoName := range pendingRepos {
+		select {
+		case <-ctx.Done():
+			if err := saveCheckpoint(true); err != nil {
+				return nil, err
+			}
+			return results, ErrGracefulStop
+		default:
+		}
+
+		progressState.CompletedRepos = len(results)
 		progressState.ActiveWorkers = cfg.Workers
 
-		repoFullName := fmt.Sprintf("%s/%s", cfg.Organization, repo.Name)
+		repoFullName := fmt.Sprintf("%s/%s", cfg.Organization, repoName)
+		currentCheckpoint.InProgress = []string{repoFullName}
+		currentCheckpoint.Pending = append([]string(nil), pendingRepos[i+1:]...)
+		if err := saveCheckpoint(false); err != nil {
+			return nil, err
+		}
 
 		if !cfg.Refresh {
 			snapshot, ok, err := cache.GetRepo(repoFullName, now)
@@ -245,7 +318,15 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 			}
 			if ok {
 				progressState.CachedRepos++
-				results = append(results, repositoryFromSnapshot(snapshot))
+				repo := repositoryFromSnapshot(snapshot)
+				results = append(results, repo)
+				currentCheckpoint.Completed[repoFullName] = snapshot
+				delete(currentCheckpoint.Failed, repoFullName)
+				currentCheckpoint.InProgress = nil
+				progressState.CompletedRepos = len(results)
+				if err := saveCheckpoint(false); err != nil {
+					return nil, err
+				}
 				advanceProgress(i)
 				continue
 			}
@@ -259,6 +340,11 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 				fmt.Printf("⚠️ Warning: Failed to check if repository is archived for %s: %v\n", repoFullName, err)
 			}
 			progressState.FailedRepos++
+			currentCheckpoint.Failed[repoFullName] = err.Error()
+			currentCheckpoint.InProgress = nil
+			if err := saveCheckpoint(false); err != nil {
+				return nil, err
+			}
 			advanceProgress(i)
 			continue
 		}
@@ -271,6 +357,11 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 				fmt.Printf("⚠️ Warning: Failed to get last commit date for %s: %v\n", repoFullName, err)
 			}
 			progressState.FailedRepos++
+			currentCheckpoint.Failed[repoFullName] = err.Error()
+			currentCheckpoint.InProgress = nil
+			if err := saveCheckpoint(false); err != nil {
+				return nil, err
+			}
 			advanceProgress(i)
 			continue
 		}
@@ -284,6 +375,11 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 				fmt.Printf("⚠️ Warning: Failed to analyze contributors for %s: %v\n", repoFullName, err)
 			}
 			progressState.FailedRepos++
+			currentCheckpoint.Failed[repoFullName] = err.Error()
+			currentCheckpoint.InProgress = nil
+			if err := saveCheckpoint(false); err != nil {
+				return nil, err
+			}
 			advanceProgress(i)
 			continue
 		}
@@ -320,8 +416,15 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		}
 
 		results = append(results, r)
+		currentCheckpoint.Completed[repoFullName] = repoSnapshotFromRepository(r, now)
+		delete(currentCheckpoint.Failed, repoFullName)
+		currentCheckpoint.InProgress = nil
+		progressState.CompletedRepos = len(results)
 		if err := cache.PutRepo(repoSnapshotFromRepository(r, now)); err != nil && !cfg.Silent {
 			fmt.Printf("⚠️ Warning: Failed to store repo cache for %s: %v\n", repoFullName, err)
+		}
+		if err := saveCheckpoint(false); err != nil {
+			return nil, err
 		}
 		advanceProgress(i)
 	}
