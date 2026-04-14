@@ -11,7 +11,9 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/harekrishnarai/inactivity/pkg/config"
+	"github.com/mattn/go-isatty"
 	"github.com/schollz/progressbar/v3"
+	"golang.org/x/term"
 )
 
 // Repository represents a GitHub repository with its inactivity status
@@ -166,6 +168,7 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 
 	var results []Repository
 	now := time.Now()
+	cache := NewCacheStore(cfg.CacheDir, cfg.RepoCacheTTL, cfg.MembershipCacheTTL)
 	startTime := time.Now()
 	progressState := ProgressState{
 		Mode:           "org",
@@ -178,7 +181,8 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 	}
 
 	if !cfg.Silent {
-		fmt.Println(RenderHeader(progressState, 80, false))
+		width, colorEnabled := terminalHeaderSettings()
+		fmt.Println(RenderHeader(progressState, width, colorEnabled))
 		fmt.Println()
 	}
 
@@ -233,9 +237,21 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		progressState.ActiveWorkers = cfg.Workers
 
 		repoFullName := fmt.Sprintf("%s/%s", cfg.Organization, repo.Name)
-		r := Repository{
-			Name: repoFullName,
+
+		if !cfg.Refresh {
+			snapshot, ok, err := cache.GetRepo(repoFullName, now)
+			if err != nil {
+				return nil, fmt.Errorf("get repo cache: %w", err)
+			}
+			if ok {
+				progressState.CachedRepos++
+				results = append(results, repositoryFromSnapshot(snapshot))
+				advanceProgress(i)
+				continue
+			}
 		}
+
+		r := Repository{Name: repoFullName}
 		// Check if repository is archived
 		isArchived, err := isRepositoryArchived(repoFullName)
 		if err != nil {
@@ -262,7 +278,7 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		r.DaysSinceLastCommit = int(now.Sub(lastCommitDate).Hours() / 24)
 
 		// Get contributors and check if they are still in the organization
-		activeContribs, inactiveContribs, err := getContributorsStatus(repoFullName, cfg.Organization)
+		activeContribs, inactiveContribs, err := getContributorsStatusWithCache(repoFullName, cfg.Organization, cache, now, cfg.Refresh)
 		if err != nil {
 			if !cfg.Silent {
 				fmt.Printf("⚠️ Warning: Failed to analyze contributors for %s: %v\n", repoFullName, err)
@@ -304,10 +320,28 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		}
 
 		results = append(results, r)
+		if err := cache.PutRepo(repoSnapshotFromRepository(r, now)); err != nil && !cfg.Silent {
+			fmt.Printf("⚠️ Warning: Failed to store repo cache for %s: %v\n", repoFullName, err)
+		}
 		advanceProgress(i)
 	}
 
 	return results, nil
+}
+
+func terminalHeaderSettings() (int, bool) {
+	width := 80
+	colorEnabled := false
+
+	if termWidth, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && termWidth > 0 {
+		width = termWidth
+	}
+
+	if isatty.IsTerminal(os.Stdout.Fd()) && !color.NoColor {
+		colorEnabled = true
+	}
+
+	return width, colorEnabled
 }
 
 // formatDuration returns a human-readable string for the given duration
@@ -364,7 +398,60 @@ func GetLastCommitDate(repoFullName string) (time.Time, error) {
 
 // GetContributorsStatus checks how many contributors are still active in the organization
 func GetContributorsStatus(repoFullName, orgName string) (active, inactive int, err error) {
-	// Get all contributors
+	return getContributorsStatusImpl(repoFullName, orgName, nil, time.Time{}, false)
+}
+
+func getContributorsStatusWithCache(repoFullName, orgName string, cache *CacheStore, now time.Time, refresh bool) (active, inactive int, err error) {
+	return getContributorsStatusImpl(repoFullName, orgName, cache, now, refresh)
+}
+
+func getContributorsStatusImpl(repoFullName, orgName string, cache *CacheStore, now time.Time, refresh bool) (active, inactive int, err error) {
+	contributors, err := listContributors(repoFullName)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	for _, contributor := range contributors {
+		if cache != nil && !refresh {
+			snapshot, ok, err := cache.GetMembership(orgName, contributor, now)
+			if err != nil {
+				return 0, 0, err
+			}
+			if ok {
+				if snapshot.Active {
+					active++
+				} else {
+					inactive++
+				}
+				continue
+			}
+		}
+
+		isActive, err := checkOrgMembership(orgName, contributor)
+		if err != nil {
+			inactive++
+			continue
+		}
+		if isActive {
+			active++
+		} else {
+			inactive++
+		}
+
+		if cache != nil {
+			_ = cache.PutMembership(MembershipSnapshot{
+				Organization: orgName,
+				Login:        contributor,
+				Active:       isActive,
+				FetchedAt:    now,
+			})
+		}
+	}
+
+	return active, inactive, nil
+}
+
+func listContributors(repoFullName string) ([]string, error) {
 	cmd := exec.Command("gh", "api",
 		fmt.Sprintf("repos/%s/contributors", repoFullName),
 		"--jq", ".[].login")
@@ -372,14 +459,11 @@ func GetContributorsStatus(repoFullName, orgName string) (active, inactive int, 
 	var out bytes.Buffer
 	cmd.Stdout = &out
 
-	err = cmd.Run()
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get contributors: %w", err)
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("failed to get contributors: %w", err)
 	}
 
 	contributors := strings.Split(strings.TrimSpace(out.String()), "\n")
-
-	// Filter out empty strings
 	var validContributors []string
 	for _, c := range contributors {
 		if c != "" {
@@ -387,25 +471,46 @@ func GetContributorsStatus(repoFullName, orgName string) (active, inactive int, 
 		}
 	}
 
-	if len(validContributors) == 0 {
-		return 0, 0, nil
+	return validContributors, nil
+}
+
+func checkOrgMembership(orgName, login string) (bool, error) {
+	cmd := exec.Command("gh", "api",
+		fmt.Sprintf("orgs/%s/members/%s", orgName, login),
+		"--silent")
+
+	if err := cmd.Run(); err != nil {
+		return false, err
 	}
 
-	// Check if each contributor is still in the organization
-	for _, contributor := range validContributors {
-		cmd := exec.Command("gh", "api",
-			fmt.Sprintf("orgs/%s/members/%s", orgName, contributor),
-			"--silent")
+	return true, nil
+}
 
-		if err := cmd.Run(); err != nil {
-			// User is not in the organization anymore
-			inactive++
-		} else {
-			active++
-		}
+func repositoryFromSnapshot(snapshot RepoSnapshot) Repository {
+	return Repository{
+		Name:                 snapshot.Repository,
+		LastCommitDate:       snapshot.LastCommitDate,
+		DaysSinceLastCommit:  snapshot.DaysSinceLastCommit,
+		TotalContributors:    snapshot.TotalContributors,
+		InactiveContributors: snapshot.InactiveContributors,
+		InactivePercentage:   snapshot.InactivePercentage,
+		Archived:             snapshot.Archived,
+		Flagged:              snapshot.Flagged,
 	}
+}
 
-	return active, inactive, nil
+func repoSnapshotFromRepository(repo Repository, fetchedAt time.Time) RepoSnapshot {
+	return RepoSnapshot{
+		Repository:           repo.Name,
+		Archived:             repo.Archived,
+		LastCommitDate:       repo.LastCommitDate,
+		DaysSinceLastCommit:  repo.DaysSinceLastCommit,
+		TotalContributors:    repo.TotalContributors,
+		InactiveContributors: repo.InactiveContributors,
+		InactivePercentage:   repo.InactivePercentage,
+		Flagged:              repo.Flagged,
+		FetchedAt:            fetchedAt,
+	}
 }
 
 // OutputResults outputs the analysis results in the specified format
