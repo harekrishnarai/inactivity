@@ -17,6 +17,13 @@ type ProgressState struct {
 	Phase            string
 }
 
+type RateLimitState struct {
+	Limit     int
+	Remaining int
+	Used      int
+	ResetAt   time.Time
+}
+
 type RepoSnapshot struct {
 	Repository           string    `json:"repository"`
 	Archived             bool      `json:"archived"`

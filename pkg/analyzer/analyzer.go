@@ -168,6 +168,7 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 	cache := NewCacheStore(cfg.CacheDir, cfg.RepoCacheTTL, cfg.MembershipCacheTTL)
 	checkpointStore := NewCheckpointStore(cfg.CheckpointDir)
 	startTime := time.Now()
+	rateLimiter := NewRateLimiter(cfg.RateLimitFloor)
 	progressState := ProgressState{
 		Mode:           "org",
 		Target:         cfg.Organization,
@@ -302,7 +303,23 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		}
 
 		progressState.CompletedRepos = len(results)
-		progressState.ActiveWorkers = cfg.Workers
+		rateLimitKnown := false
+		if state, err := loadRateLimitState(ctx); err == nil {
+			rateLimiter.Update(state)
+			rateLimitKnown = true
+		}
+		if rateLimitKnown {
+			progressState.ActiveWorkers = rateLimiter.RecommendedWorkers(cfg.Workers)
+			currentCheckpoint.Progress = progressState
+			if rateLimiter.ShouldPause() {
+				if err := saveCheckpoint(false); err != nil {
+					return nil, err
+				}
+				return results, ErrRateLimitPause
+			}
+		} else {
+			progressState.ActiveWorkers = cfg.Workers
+		}
 
 		repoFullName := fmt.Sprintf("%s/%s", cfg.Organization, repoName)
 		currentCheckpoint.InProgress = []string{repoFullName}
