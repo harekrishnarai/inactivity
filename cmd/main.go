@@ -17,6 +17,8 @@ import (
 	"github.com/harekrishnarai/inactivity/pkg/config"
 )
 
+const Version = "v0.2.2"
+
 // Main is the entry point for the application
 // It's exported so it can be called from the root package
 func Main() {
@@ -206,7 +208,7 @@ func displayUsage() {
 	yellow := color.New(color.FgYellow, color.Bold).SprintFunc()
 	green := color.New(color.FgGreen, color.Bold).SprintFunc()
 
-	fmt.Printf("\n%s\n\n", cyan("Repository Inactivity Analyzer"))
+	fmt.Printf("\n%s\n\n", cyan(fmt.Sprintf("Repository Inactivity Analyzer %s", Version)))
 	fmt.Printf("%s\n", yellow("Usage:"))
 	fmt.Printf("  %s\n", green("inactivity org [options]"))
 	fmt.Printf("  %s\n", green("inactivity org [format] [options]  # Alternative syntax"))
