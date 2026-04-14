@@ -177,6 +177,11 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		Phase:          "scan",
 	}
 
+	if !cfg.Silent {
+		fmt.Println(RenderHeader(progressState, 80, false))
+		fmt.Println()
+	}
+
 	// Create progress bar
 	var bar *progressbar.ProgressBar
 	if !cfg.Silent {
