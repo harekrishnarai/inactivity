@@ -17,7 +17,7 @@ import (
 	"github.com/harekrishnarai/inactivity/pkg/config"
 )
 
-const Version = "v0.3.0"
+const Version = "v0.3.1"
 
 // Main is the entry point for the application
 // It's exported so it can be called from the root package
