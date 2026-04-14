@@ -1,32 +1,24 @@
 package analyzer
 
 import (
-	"bytes"
+	"context"
 	"fmt"
-	"os/exec"
-	"strings"
 )
 
 // isRepositoryArchived is an internal function that checks if a repository is archived
-func isRepositoryArchived(repoFullName string) (bool, error) {
-	// Delegate to the exported version
-	return IsRepositoryArchived(repoFullName)
+func isRepositoryArchived(ctx context.Context, client GitHubClient, repoFullName string) (bool, error) {
+	metadata, err := client.GetRepoMetadata(ctx, repoFullName)
+	if err != nil {
+		return false, fmt.Errorf("failed to check if repository is archived: %w", err)
+	}
+	return metadata.Archived, nil
 }
 
 // IsRepositoryArchived checks if a repository is archived in GitHub
 func IsRepositoryArchived(repoFullName string) (bool, error) {
-	cmd := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s", repoFullName),
-		"--jq", ".archived")
-
-	var out bytes.Buffer
-	cmd.Stdout = &out
-
-	err := cmd.Run()
+	client, err := gitHubClientFactory(context.Background())
 	if err != nil {
-		return false, fmt.Errorf("failed to check if repository is archived: %w", err)
+		return false, err
 	}
-
-	result := strings.TrimSpace(out.String())
-	return result == "true", nil
+	return isRepositoryArchived(context.Background(), client, repoFullName)
 }

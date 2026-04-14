@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -24,53 +26,20 @@ func Main() {
 		os.Exit(1)
 	}
 
-	// Initialize config with defaults
-	cfg := config.Config{
-		MaxCommitAgeInDays:       180,
-		InactiveContribThreshold: 0.5,
-		OutputFormat:             "console",
-	}
-
-	// Define common flags for all commands
+	cfg := config.Default()
 	commonFlags := flag.NewFlagSet("common", flag.ExitOnError)
-	commonFlags.IntVar(&cfg.MaxCommitAgeInDays, "days", 180, "Maximum age of last commit in days")
-	commonFlags.Float64Var(&cfg.InactiveContribThreshold, "threshold", 0.5, "Threshold of inactive contributors (0.0-1.0)")
-	commonFlags.StringVar(&cfg.OutputFormat, "format", "console", "Output format: console, json, or csv")
+	commonFlags.IntVar(&cfg.MaxCommitAgeInDays, "days", cfg.MaxCommitAgeInDays, "Maximum age of last commit in days")
+	commonFlags.Float64Var(&cfg.InactiveContribThreshold, "threshold", cfg.InactiveContribThreshold, "Threshold of inactive contributors (0.0-1.0)")
+	commonFlags.StringVar(&cfg.OutputFormat, "format", cfg.OutputFormat, "Output format: console, json, or csv")
 	commonFlags.StringVar(&cfg.OutputFile, "output", "", "Output file path (optional)")
-	commonFlags.BoolVar(&cfg.Silent, "silent", false, "Suppress banner and progress output") // Process command
+	commonFlags.BoolVar(&cfg.Silent, "silent", false, "Suppress banner and progress output")
+
 	switch os.Args[1] {
 	case "org":
-		// The original functionality: analyze an organization's repositories
-		orgCmd := flag.NewFlagSet("org", flag.ExitOnError)
-		orgCmd.StringVar(&cfg.Organization, "org", "", "GitHub organization to analyze")
-
-		// Add common flags to org command
-		orgCmd.IntVar(&cfg.MaxCommitAgeInDays, "days", 180, "Maximum age of last commit in days")
-		orgCmd.Float64Var(&cfg.InactiveContribThreshold, "threshold", 0.5, "Threshold of inactive contributors (0.0-1.0)")
-		orgCmd.StringVar(&cfg.OutputFormat, "format", "console", "Output format: console, json, or csv")
-		orgCmd.StringVar(&cfg.OutputFile, "output", "", "Output file path (optional)")
-		orgCmd.BoolVar(&cfg.Silent, "silent", false, "Suppress banner and progress output") // Parse org command flags only once
-		if err := orgCmd.Parse(os.Args[2:]); err != nil {
+		cfg, err := parseOrgArgs(os.Args[2:])
+		if err != nil {
 			log.Fatalf("❌ Failed to parse org command flags: %v", err)
 		}
-		// Check for positional arguments
-		if orgCmd.NArg() > 0 {
-			// First positional argument could be the format
-			if orgCmd.NArg() >= 1 {
-				if orgCmd.Arg(0) == "json" || orgCmd.Arg(0) == "csv" || orgCmd.Arg(0) == "console" {
-					cfg.OutputFormat = orgCmd.Arg(0)
-				}
-			}
-
-			// Check for output as a separate positional argument
-			for i := 0; i < orgCmd.NArg(); i++ {
-				if orgCmd.Arg(i) == "-output" && i+1 < orgCmd.NArg() {
-					cfg.OutputFile = orgCmd.Arg(i + 1)
-					break
-				}
-			}
-		}
-
 		// Run the organization analysis
 		analyzeOrganization(cfg)
 
@@ -177,6 +146,59 @@ func Main() {
 	}
 }
 
+func parseOrgArgs(args []string) (config.Config, error) {
+	cfg := config.Default()
+
+	orgCmd := flag.NewFlagSet("org", flag.ContinueOnError)
+	orgCmd.SetOutput(io.Discard)
+
+	orgCmd.StringVar(&cfg.Organization, "org", "", "GitHub organization to analyze")
+	orgCmd.IntVar(&cfg.MaxCommitAgeInDays, "days", cfg.MaxCommitAgeInDays, "Maximum age of last commit in days")
+	orgCmd.Float64Var(&cfg.InactiveContribThreshold, "threshold", cfg.InactiveContribThreshold, "Threshold of inactive contributors (0.0-1.0)")
+	orgCmd.StringVar(&cfg.OutputFormat, "format", cfg.OutputFormat, "Output format: console, json, or csv")
+	orgCmd.StringVar(&cfg.OutputFile, "output", "", "Output file path (optional)")
+	orgCmd.BoolVar(&cfg.Silent, "silent", false, "Suppress banner and progress output")
+	orgCmd.BoolVar(&cfg.Resume, "resume", false, "Resume from the latest checkpoint for this org scan")
+	orgCmd.BoolVar(&cfg.Refresh, "refresh", false, "Ignore cached repo and membership data")
+	orgCmd.IntVar(&cfg.Workers, "workers", cfg.Workers, "Maximum concurrent repository workers")
+	orgCmd.IntVar(&cfg.RateLimitFloor, "rate-limit-floor", cfg.RateLimitFloor, "Pause the scan when the remaining GitHub API budget reaches this floor")
+	orgCmd.StringVar(&cfg.CacheDir, "cache-dir", cfg.CacheDir, "Directory used for local cache files")
+	orgCmd.StringVar(&cfg.CheckpointDir, "checkpoint-dir", cfg.CheckpointDir, "Directory used for resumable checkpoint files")
+
+	if err := orgCmd.Parse(args); err != nil {
+		return config.Config{}, err
+	}
+
+	if orgCmd.NArg() > 0 {
+		if arg := orgCmd.Arg(0); arg == "json" || arg == "csv" || arg == "console" {
+			cfg.OutputFormat = arg
+		}
+
+		for i := 0; i < orgCmd.NArg(); i++ {
+			if orgCmd.Arg(i) == "-output" && i+1 < orgCmd.NArg() {
+				cfg.OutputFile = orgCmd.Arg(i + 1)
+				break
+			}
+		}
+	}
+
+	return cfg, nil
+}
+
+func handleAnalyzeOrganizationError(err error) bool {
+	if errors.Is(err, analyzer.ErrRateLimitPause) {
+		fmt.Println("Scan paused at the configured rate-limit floor. Re-run with --resume to continue.")
+		return true
+	}
+
+	if errors.Is(err, analyzer.ErrGracefulStop) {
+		fmt.Println("Scan stopped gracefully. Re-run with --resume to continue.")
+		return true
+	}
+
+	return false
+}
+
 // displayUsage shows the usage information for the tool
 func displayUsage() {
 	// Create color functions
@@ -210,9 +232,18 @@ func displayUsage() {
 	fmt.Printf("  %s\t%s\n", green("-output string"), "Output file path (optional)")
 	fmt.Printf("  %s\t%s\n", green("-silent"), "Suppress banner and progress output")
 	fmt.Printf("  %s\t%s\n\n", green("-org string"), "GitHub organization to analyze (for 'org' command)")
+	fmt.Printf("  %s\t%s\n", green("-resume"), "Resume from the latest checkpoint for this org scan")
+	fmt.Printf("  %s\t%s\n", green("-refresh"), "Ignore cached repo and membership data")
+	fmt.Printf("  %s\t%s\n", green("-workers int"), "Maximum concurrent repository workers (default: 6)")
+	fmt.Printf("  %s\t%s\n", green("-rate-limit-floor int"), "Pause the scan when the remaining GitHub API budget reaches this floor (default: 200)")
+	fmt.Printf("  %s\t%s\n", green("-cache-dir string"), "Directory used for local cache files (default: .inactivity/cache)")
+	fmt.Printf("  %s\t%s\n\n", green("-checkpoint-dir string"), "Directory used for resumable checkpoint files (default: .inactivity/checkpoints)")
 
 	fmt.Printf("%s\n", yellow("Examples:"))
 	fmt.Printf("  %s\n", green("inactivity org -org mycompany"))
+	fmt.Printf("  %s\n", green("inactivity org -org mycompany -resume"))
+	fmt.Printf("  %s\n", green("inactivity org -org mycompany -workers 8 -rate-limit-floor 300"))
+	fmt.Printf("  %s\n", green("inactivity org -org mycompany -refresh"))
 	fmt.Printf("  %s\n", green("inactivity repo mycompany/myrepo -days 90"))
 	fmt.Printf("  %s\n", green("inactivity file repos.txt -format csv -output results.csv"))
 	fmt.Printf("  %s\n", green("inactivity org -org mycompany -format json -output results.json"))
@@ -222,43 +253,6 @@ func displayUsage() {
 
 // analyzeOrganization analyzes all repositories in an organization
 func analyzeOrganization(cfg config.Config) {
-	// Display banner unless silent mode is enabled
-	if !cfg.Silent {
-		// Custom banner for organization analysis
-		cyan := color.New(color.FgCyan).SprintFunc()
-		yellow := color.New(color.FgYellow).SprintFunc()
-		red := color.New(color.FgRed).SprintFunc()
-		green := color.New(color.FgGreen).SprintFunc()
-		purple := color.New(color.FgMagenta).SprintFunc()
-		blue := color.New(color.FgBlue).SprintFunc()
-		white := color.New(color.FgHiWhite, color.Bold).SprintFunc()
-
-		// Print a creative organization analysis banner
-		fmt.Println()
-		fmt.Println(red("  ╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱"))
-		fmt.Println(yellow(" ╱    ") + white("ORGANIZATION HEALTH MONITOR") + yellow("                            ╱"))
-		fmt.Println(green("╱                                                         ╱"))
-		fmt.Println(cyan("╱") + blue("  ┌───────────────────────────────────────────────────────┐") + cyan(" ╱"))
-		fmt.Println(cyan("╱") + blue("  │") + "                                                       " + blue("│") + cyan(" ╱"))
-		fmt.Println(cyan("╱") + blue("  │") + "  " + red("◉") + white(" ORGANIZATION PORTFOLIO ANALYZER ") + red("◉") + "                " + blue("│") + cyan(" ╱"))
-		fmt.Println(cyan("╱") + blue("  │") + "                                                       " + blue("│") + cyan(" ╱"))
-		fmt.Println(cyan("╱") + blue("  │") + "  " + purple("⚡") + green(" Scanning All Repositories") + "                           " + blue("│") + cyan(" ╱"))
-		fmt.Println(cyan("╱") + blue("  │") + "  " + yellow("⚡") + green(" Detecting Inactive Projects") + "                         " + blue("│") + cyan(" ╱"))
-		fmt.Println(cyan("╱") + blue("  │") + "  " + cyan("⚡") + green(" Analyzing Contributor Engagement") + "                    " + blue("│") + cyan(" ╱"))
-		fmt.Println(cyan("╱") + blue("  │") + "                                                       " + blue("│") + cyan(" ╱"))
-		fmt.Println(cyan("╱") + blue("  │") + "  " + white("REPO·PULSE ENTERPRISE") + "                               " + blue("│") + cyan(" ╱"))
-		fmt.Println(cyan("╱") + blue("  │") + "                                                       " + blue("│") + cyan(" ╱"))
-		fmt.Println(cyan("╱") + blue("  └───────────────────────────────────────────────────────┘") + cyan(" ╱"))
-		fmt.Println(green("╱                                                         ╱"))
-		fmt.Println(yellow("╱                                                         ╱"))
-		fmt.Println(red("╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱"))
-		fmt.Println()
-
-		fmt.Println(yellow("✦ Repository Inactivity Analyzer - Organization Mode ✦"))
-		fmt.Println(cyan("⟹ Analyzing repositories across an entire organization"))
-		fmt.Println()
-	}
-
 	// Validate GitHub CLI installation
 	if err := analyzer.ValidateGitHubCLI(); err != nil {
 		log.Fatalf("❌ GitHub CLI validation failed: %v", err)
@@ -296,13 +290,12 @@ func analyzeOrganization(cfg config.Config) {
 		}
 	}
 
-	if !cfg.Silent {
-		fmt.Printf("\n🔬 Analyzing repositories in %s...\n", cfg.Organization)
-	}
-
 	// Analyze repositories
 	repos, err := analyzer.AnalyzeRepositories(cfg)
 	if err != nil {
+		if handleAnalyzeOrganizationError(err) {
+			return
+		}
 		log.Fatalf("❌ Analysis failed: %v", err)
 	}
 
