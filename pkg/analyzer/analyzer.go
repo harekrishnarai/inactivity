@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +16,12 @@ import (
 	"github.com/mattn/go-isatty"
 	"github.com/schollz/progressbar/v3"
 	"golang.org/x/term"
+)
+
+var (
+	orgRepositoriesLoader = listOrganizationRepos
+	interruptWatcher      = watchInterrupts
+	gitHubClientFactory   = NewGitHubClient
 )
 
 // Repository represents a GitHub repository with its inactivity status
@@ -112,111 +119,64 @@ func DisplayBanner(silent bool, showOrgBanner bool) {
 
 // AnalyzeRepositories analyzes all repositories in the given organization
 func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
-	// Use pagination to get all repositories in the organization
-	// We'll start with a higher limit and implement pagination logic
-	var allRepos []string
-
-	page := 1
-	perPage := 100 // GitHub API typically uses 100 as maximum per page
-
-	for {
-		if !cfg.Silent {
-			fmt.Printf("📄 Fetching page %d of repositories...\n", page)
-		}
-
-		cmd := exec.Command("gh", "api",
-			fmt.Sprintf("orgs/%s/repos?per_page=%d&page=%d", cfg.Organization, perPage, page),
-			"--jq", ".[].name")
-
-		var out bytes.Buffer
-		cmd.Stdout = &out
-		cmd.Stderr = os.Stderr
-
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("failed to list repositories on page %d: %w", page, err)
-		}
-
-		// Get repo names from the output
-		repoNames := strings.Split(strings.TrimSpace(out.String()), "\n")
-
-		// If we got fewer items than perPage or empty response, we've reached the end
-		if len(repoNames) == 0 || (len(repoNames) == 1 && repoNames[0] == "") {
-			break
-		}
-
-		// Add repos to our collection
-		for _, name := range repoNames {
-			if name != "" { // Skip empty lines
-				allRepos = append(allRepos, name)
-			}
-		}
-
-		// Check if we got fewer items than the maximum per page, which means we're done
-		if len(repoNames) < perPage {
-			break
-		}
-
-		page++
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopSignals := interruptWatcher(cancel)
+	defer stopSignals()
+	client, err := gitHubClientFactory(ctx)
+	if err != nil {
+		return nil, err
 	}
-
-	if !cfg.Silent {
-		fmt.Printf("📂 Found %d repositories in %s\n", len(allRepos), cfg.Organization)
-	}
-
-	var results []Repository
-	now := time.Now()
-	cache := NewCacheStore(cfg.CacheDir, cfg.RepoCacheTTL, cfg.MembershipCacheTTL)
-	checkpointStore := NewCheckpointStore(cfg.CheckpointDir)
-	startTime := time.Now()
-	rateLimiter := NewRateLimiter(cfg.RateLimitFloor)
 	progressState := ProgressState{
 		Mode:           "org",
 		Target:         cfg.Organization,
 		ResumeEnabled:  cfg.Resume,
 		Workers:        cfg.Workers,
 		RateLimitFloor: cfg.RateLimitFloor,
-		TotalRepos:     len(allRepos),
-		Phase:          "scan",
+		Phase:          "enumerate",
 	}
-	pendingRepos := append([]string(nil), allRepos...)
+	var results []Repository
+	now := time.Now()
+	cache := NewCacheStore(cfg.CacheDir, cfg.RepoCacheTTL, cfg.MembershipCacheTTL)
+	checkpointStore := NewCheckpointStore(cfg.CheckpointDir)
+	startTime := time.Now()
+	rateLimiter := NewRateLimiter(cfg.RateLimitFloor)
 	currentCheckpoint := Checkpoint{
 		RunID:     fmt.Sprintf("run-%d", now.UTC().UnixNano()),
 		Target:    cfg.Organization,
 		StartedAt: now.UTC(),
 		UpdatedAt: now.UTC(),
-		Pending:   append([]string(nil), pendingRepos...),
 		Completed: map[string]RepoSnapshot{},
 		Failed:    map[string]string{},
 		Progress:  progressState,
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	stopSignals := watchInterrupts(cancel)
-	defer stopSignals()
+	resumeScanState := false
 
 	if cfg.Resume {
 		if checkpoint, err := checkpointStore.LoadLatest(cfg.Organization); err == nil {
-			pendingRepos = resumePendingRepos(allRepos, checkpoint)
 			currentCheckpoint = checkpoint
 			if currentCheckpoint.RunID == "" {
 				currentCheckpoint.RunID = fmt.Sprintf("run-%d", now.UTC().UnixNano())
 			}
-			if currentCheckpoint.StartedAt.IsZero() {
-				currentCheckpoint.StartedAt = now.UTC()
-			}
-			currentCheckpoint.Target = cfg.Organization
-			currentCheckpoint.Pending = append([]string(nil), pendingRepos...)
-			currentCheckpoint.InProgress = nil
-			if currentCheckpoint.Completed == nil {
-				currentCheckpoint.Completed = map[string]RepoSnapshot{}
+				if currentCheckpoint.StartedAt.IsZero() {
+					currentCheckpoint.StartedAt = now.UTC()
+				}
+				currentCheckpoint.Target = cfg.Organization
+				currentCheckpoint.InProgress = nil
+				if currentCheckpoint.Completed == nil {
+					currentCheckpoint.Completed = map[string]RepoSnapshot{}
 			}
 			if currentCheckpoint.Failed == nil {
 				currentCheckpoint.Failed = map[string]string{}
 			}
-			results = append(results, completedRepositories(checkpoint, allRepos)...)
-			progressState.CompletedRepos = len(results)
-			progressState.FailedRepos = len(checkpointFailures(checkpoint, allRepos))
+			progressState = currentCheckpoint.Progress
+			progressState.Mode = "org"
+			progressState.Target = cfg.Organization
+			progressState.ResumeEnabled = cfg.Resume
+			progressState.Workers = cfg.Workers
+			progressState.RateLimitFloor = cfg.RateLimitFloor
 			currentCheckpoint.Progress = progressState
+			resumeScanState = progressState.Phase == "scan"
 		}
 	}
 
@@ -233,6 +193,32 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		}
 		return nil
 	}
+
+	var allRepos []string
+	if resumeScanState && len(currentCheckpoint.Discovered) > 0 {
+		allRepos = append([]string(nil), currentCheckpoint.Discovered...)
+	} else {
+		allRepos, err = loadOrganizationReposWithCheckpoint(ctx, client, cfg.Organization, checkpointStore, &currentCheckpoint, &progressState)
+		if err != nil {
+			return nil, err
+		}
+	}
+	progressState.TotalRepos = len(allRepos)
+	progressState.Phase = "scan"
+	currentCheckpoint.NextPage = 0
+
+	if !cfg.Silent {
+		fmt.Printf("📂 Found %d repositories in %s\n", len(allRepos), cfg.Organization)
+	}
+
+	pendingRepos := append([]string(nil), allRepos...)
+	if resumeScanState {
+		pendingRepos = resumePendingRepos(allRepos, currentCheckpoint)
+		results = append(results, completedRepositories(currentCheckpoint, allRepos)...)
+		progressState.CompletedRepos = len(results)
+		progressState.FailedRepos = len(checkpointFailures(currentCheckpoint, allRepos))
+	}
+	currentCheckpoint.Pending = append([]string(nil), pendingRepos...)
 
 	if !cfg.Silent {
 		width, colorEnabled := terminalHeaderSettings()
@@ -303,22 +289,36 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		}
 
 		progressState.CompletedRepos = len(results)
-		rateLimitKnown := false
-		if state, err := loadRateLimitState(ctx); err == nil {
-			rateLimiter.Update(state)
-			rateLimitKnown = true
+		if rateLimiter.ShouldPoll(i) {
+			if state, err := client.GetRateLimitState(ctx); err == nil {
+				rateLimiter.Update(state)
+			} else {
+				rateLimiter.UseLastKnownOrFallback()
+			}
 		}
-		if rateLimitKnown {
-			progressState.ActiveWorkers = rateLimiter.RecommendedWorkers(cfg.Workers)
+		if rateLimiter.HasState() {
+			progressState.WorkerRecommendation = rateLimiter.RecommendedWorkers(cfg.Workers)
+			progressState.ActiveWorkers = 1
+			if progressState.WorkerRecommendation == 0 {
+				progressState.ActiveWorkers = 0
+			}
+			progressState.RateLimitRemaining = rateLimiter.state.Remaining
+			progressState.RateLimitResetAt = rateLimiter.state.ResetAt
 			currentCheckpoint.Progress = progressState
 			if rateLimiter.ShouldPause() {
-				if err := saveCheckpoint(false); err != nil {
-					return nil, err
+				currentCheckpoint.InProgress = nil
+				currentCheckpoint.Pending = append([]string(nil), pendingRepos[i:]...)
+				currentCheckpoint.Progress = progressState
+				if err := checkpointStore.Save(currentCheckpoint); err != nil {
+					return nil, fmt.Errorf("save checkpoint before rate limit pause: %w", err)
 				}
 				return results, ErrRateLimitPause
 			}
 		} else {
-			progressState.ActiveWorkers = cfg.Workers
+			progressState.ActiveWorkers = 1
+			progressState.WorkerRecommendation = cfg.Workers
+			progressState.RateLimitRemaining = 0
+			progressState.RateLimitResetAt = time.Time{}
 		}
 
 		repoFullName := fmt.Sprintf("%s/%s", cfg.Organization, repoName)
@@ -351,8 +351,14 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 
 		r := Repository{Name: repoFullName}
 		// Check if repository is archived
-		isArchived, err := isRepositoryArchived(repoFullName)
+		isArchived, err := isRepositoryArchived(ctx, client, repoFullName)
 		if err != nil {
+			if interrupted(ctx, err) {
+				if err := saveCheckpoint(true); err != nil {
+					return nil, err
+				}
+				return results, ErrGracefulStop
+			}
 			if !cfg.Silent {
 				fmt.Printf("⚠️ Warning: Failed to check if repository is archived for %s: %v\n", repoFullName, err)
 			}
@@ -368,8 +374,14 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		r.Archived = isArchived
 
 		// Get last commit date
-		lastCommitDate, err := getLastCommitDate(repoFullName)
+		lastCommitDate, err := getLastCommitDate(ctx, client, repoFullName)
 		if err != nil {
+			if interrupted(ctx, err) {
+				if err := saveCheckpoint(true); err != nil {
+					return nil, err
+				}
+				return results, ErrGracefulStop
+			}
 			if !cfg.Silent {
 				fmt.Printf("⚠️ Warning: Failed to get last commit date for %s: %v\n", repoFullName, err)
 			}
@@ -386,8 +398,14 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		r.DaysSinceLastCommit = int(now.Sub(lastCommitDate).Hours() / 24)
 
 		// Get contributors and check if they are still in the organization
-		activeContribs, inactiveContribs, err := getContributorsStatusWithCache(repoFullName, cfg.Organization, cache, now, cfg.Refresh)
+		activeContribs, inactiveContribs, err := getContributorsStatusWithCache(ctx, client, repoFullName, cfg.Organization, cache, now, cfg.Refresh)
 		if err != nil {
+			if interrupted(ctx, err) {
+				if err := saveCheckpoint(true); err != nil {
+					return nil, err
+				}
+				return results, ErrGracefulStop
+			}
 			if !cfg.Silent {
 				fmt.Printf("⚠️ Warning: Failed to analyze contributors for %s: %v\n", repoFullName, err)
 			}
@@ -449,6 +467,40 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 	return results, nil
 }
 
+func loadOrganizationReposWithCheckpoint(ctx context.Context, client GitHubClient, org string, checkpointStore *CheckpointStore, checkpoint *Checkpoint, progressState *ProgressState) ([]string, error) {
+	allRepos := append([]string(nil), checkpoint.Discovered...)
+	startPage := checkpoint.NextPage
+	if startPage < 1 {
+		startPage = 1
+	}
+
+	for page := startPage; ; page++ {
+		repoNames, err := client.ListOrganizationRepos(ctx, org, page, 100)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				if saveErr := checkpointStore.Save(*checkpoint); saveErr != nil {
+					return nil, fmt.Errorf("save checkpoint on shutdown: %w", saveErr)
+				}
+				return nil, ErrGracefulStop
+			}
+			return nil, fmt.Errorf("failed to list repositories on page %d: %w", page, err)
+		}
+		if len(repoNames) == 0 {
+			return allRepos, nil
+		}
+
+		allRepos = append(allRepos, repoNames...)
+		checkpoint.Discovered = append([]string(nil), allRepos...)
+		checkpoint.NextPage = page + 1
+		progressState.TotalRepos = len(allRepos)
+		progressState.Phase = "enumerate"
+		checkpoint.Progress = *progressState
+		if err := checkpointStore.Save(*checkpoint); err != nil {
+			return nil, fmt.Errorf("save checkpoint during repository enumeration: %w", err)
+		}
+	}
+}
+
 func terminalHeaderSettings() (int, bool) {
 	width := 80
 	colorEnabled := false
@@ -485,48 +537,36 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%dh %dm", h, m)
 }
 
+func interrupted(ctx context.Context, err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)
+}
+
 // GetLastCommitDate retrieves the date of the last commit for a repository
 func GetLastCommitDate(repoFullName string) (time.Time, error) {
-	cmd := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s/commits", repoFullName),
-		"--jq", ".[0].commit.committer.date",
-		"--method", "GET",
-		"--paginate",
-		"--cache", "1h")
-
-	var out bytes.Buffer
-	cmd.Stdout = &out
-
-	err := cmd.Run()
+	ctx := context.Background()
+	client, err := gitHubClientFactory(ctx)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("failed to get commits: %w", err)
+		return time.Time{}, err
 	}
-
-	dateStr := strings.TrimSpace(out.String())
-	if dateStr == "" {
-		return time.Time{}, fmt.Errorf("no commits found")
-	}
-
-	// Fix: Split the result and take only the first date if there are multiple
-	// This happens because --paginate might return multiple results
-	dates := strings.Split(dateStr, "\n")
-	firstDate := dates[0]
-
-	// Parse the ISO 8601 date format
-	return time.Parse(time.RFC3339, firstDate)
+	return client.GetLastCommitDate(ctx, repoFullName)
 }
 
 // GetContributorsStatus checks how many contributors are still active in the organization
 func GetContributorsStatus(repoFullName, orgName string) (active, inactive int, err error) {
-	return getContributorsStatusImpl(repoFullName, orgName, nil, time.Time{}, false)
+	ctx := context.Background()
+	client, err := gitHubClientFactory(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	return getContributorsStatusImpl(ctx, client, repoFullName, orgName, nil, time.Time{}, false)
 }
 
-func getContributorsStatusWithCache(repoFullName, orgName string, cache *CacheStore, now time.Time, refresh bool) (active, inactive int, err error) {
-	return getContributorsStatusImpl(repoFullName, orgName, cache, now, refresh)
+func getContributorsStatusWithCache(ctx context.Context, client GitHubClient, repoFullName, orgName string, cache *CacheStore, now time.Time, refresh bool) (active, inactive int, err error) {
+	return getContributorsStatusImpl(ctx, client, repoFullName, orgName, cache, now, refresh)
 }
 
-func getContributorsStatusImpl(repoFullName, orgName string, cache *CacheStore, now time.Time, refresh bool) (active, inactive int, err error) {
-	contributors, err := listContributors(repoFullName)
+func getContributorsStatusImpl(ctx context.Context, client GitHubClient, repoFullName, orgName string, cache *CacheStore, now time.Time, refresh bool) (active, inactive int, err error) {
+	contributors, err := client.ListContributors(ctx, repoFullName)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -547,7 +587,7 @@ func getContributorsStatusImpl(repoFullName, orgName string, cache *CacheStore, 
 			}
 		}
 
-		isActive, err := checkOrgMembership(orgName, contributor)
+		isActive, err := client.IsOrgMember(ctx, orgName, contributor)
 		if err != nil {
 			inactive++
 			continue
@@ -569,41 +609,6 @@ func getContributorsStatusImpl(repoFullName, orgName string, cache *CacheStore, 
 	}
 
 	return active, inactive, nil
-}
-
-func listContributors(repoFullName string) ([]string, error) {
-	cmd := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s/contributors", repoFullName),
-		"--jq", ".[].login")
-
-	var out bytes.Buffer
-	cmd.Stdout = &out
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("failed to get contributors: %w", err)
-	}
-
-	contributors := strings.Split(strings.TrimSpace(out.String()), "\n")
-	var validContributors []string
-	for _, c := range contributors {
-		if c != "" {
-			validContributors = append(validContributors, c)
-		}
-	}
-
-	return validContributors, nil
-}
-
-func checkOrgMembership(orgName, login string) (bool, error) {
-	cmd := exec.Command("gh", "api",
-		fmt.Sprintf("orgs/%s/members/%s", orgName, login),
-		"--silent")
-
-	if err := cmd.Run(); err != nil {
-		return false, err
-	}
-
-	return true, nil
 }
 
 func repositoryFromSnapshot(snapshot RepoSnapshot) Repository {
@@ -856,31 +861,14 @@ func OutputSingleRepositoryResult(repo Repository, cfg config.Config) error {
 
 // GetRepositoryDetails retrieves various details for a repository
 func GetRepositoryDetails(repoFullName string) (time.Time, bool, error) {
-	cmd := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s", repoFullName),
-		"--jq", "{archived: .archived, updated_at: .updated_at}")
-
-	var out bytes.Buffer
-	cmd.Stdout = &out
-
-	err := cmd.Run()
+	ctx := context.Background()
+	client, err := gitHubClientFactory(ctx)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	metadata, err := client.GetRepoMetadata(ctx, repoFullName)
 	if err != nil {
 		return time.Time{}, false, fmt.Errorf("failed to get repository details: %w", err)
 	}
-
-	var result struct {
-		Archived  bool   `json:"archived"`
-		UpdatedAt string `json:"updated_at"`
-	}
-
-	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
-		return time.Time{}, false, fmt.Errorf("failed to parse repository details: %w", err)
-	}
-
-	updatedAt, err := time.Parse(time.RFC3339, result.UpdatedAt)
-	if err != nil {
-		return time.Time{}, result.Archived, fmt.Errorf("failed to parse updated_at time: %w", err)
-	}
-
-	return updatedAt, result.Archived, nil
+	return metadata.UpdatedAt, metadata.Archived, nil
 }

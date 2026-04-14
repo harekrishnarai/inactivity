@@ -28,10 +28,10 @@ func (c *CacheStore) GetRepo(name string, now time.Time) (RepoSnapshot, bool, er
 		if os.IsNotExist(err) {
 			return RepoSnapshot{}, false, nil
 		}
-		return RepoSnapshot{}, false, err
+		return RepoSnapshot{}, false, nil
 	}
 
-	if !snapshot.FetchedAt.IsZero() && c.repoTTL > 0 && now.Sub(snapshot.FetchedAt) > c.repoTTL {
+	if snapshotExpired(snapshot.FetchedAt, c.repoTTL, now) {
 		return RepoSnapshot{}, false, nil
 	}
 
@@ -49,10 +49,10 @@ func (c *CacheStore) GetMembership(org, login string, now time.Time) (Membership
 		if os.IsNotExist(err) {
 			return MembershipSnapshot{}, false, nil
 		}
-		return MembershipSnapshot{}, false, err
+		return MembershipSnapshot{}, false, nil
 	}
 
-	if !snapshot.FetchedAt.IsZero() && c.membershipTTL > 0 && now.Sub(snapshot.FetchedAt) > c.membershipTTL {
+	if snapshotExpired(snapshot.FetchedAt, c.membershipTTL, now) {
 		return MembershipSnapshot{}, false, nil
 	}
 
@@ -87,8 +87,24 @@ func writeSnapshot(path string, snapshot any) error {
 		return fmt.Errorf("marshal cache snapshot: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	file, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("create cache snapshot: %w", err)
+	}
+	tempPath := file.Name()
+	defer func() {
+		_ = file.Close()
+		_ = os.Remove(tempPath)
+	}()
+
+	if _, err := file.Write(data); err != nil {
 		return fmt.Errorf("write cache snapshot: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close cache snapshot: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return fmt.Errorf("replace cache snapshot: %w", err)
 	}
 
 	return nil
@@ -105,4 +121,14 @@ func readSnapshot(path string, snapshot any) error {
 	}
 
 	return nil
+}
+
+func snapshotExpired(fetchedAt time.Time, ttl time.Duration, now time.Time) bool {
+	if ttl <= 0 {
+		return false
+	}
+	if fetchedAt.IsZero() {
+		return true
+	}
+	return now.Sub(fetchedAt) > ttl
 }

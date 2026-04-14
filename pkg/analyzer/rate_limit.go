@@ -1,21 +1,17 @@
 package analyzer
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"os"
-	"os/exec"
-	"time"
 )
 
 var ErrRateLimitPause = errors.New("rate limit pause requested")
 
+const rateLimitPollEveryRepos = 10
+
 type RateLimiter struct {
-	floor int
-	state RateLimitState
+	floor    int
+	state    RateLimitState
+	hasState bool
 }
 
 func NewRateLimiter(floor int) *RateLimiter {
@@ -24,13 +20,31 @@ func NewRateLimiter(floor int) *RateLimiter {
 
 func (r *RateLimiter) Update(state RateLimitState) {
 	r.state = state
+	r.hasState = true
+}
+
+func (r *RateLimiter) HasState() bool {
+	return r.hasState
+}
+
+func (r *RateLimiter) UseLastKnownOrFallback() {
+	if r.hasState {
+		return
+	}
+	r.Update(RateLimitState{Remaining: r.floor})
 }
 
 func (r *RateLimiter) ShouldPause() bool {
+	if !r.hasState {
+		return false
+	}
 	return r.state.Remaining <= r.floor
 }
 
 func (r *RateLimiter) RecommendedWorkers(current int) int {
+	if !r.hasState {
+		return current
+	}
 	if r.state.Remaining <= r.floor {
 		return 0
 	}
@@ -43,33 +57,6 @@ func (r *RateLimiter) RecommendedWorkers(current int) int {
 	return current
 }
 
-func loadRateLimitState(ctx context.Context) (RateLimitState, error) {
-	cmd := exec.CommandContext(ctx, "gh", "api", "rate_limit")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return RateLimitState{}, fmt.Errorf("get GitHub rate limit: %w", err)
-	}
-
-	var response struct {
-		Rate struct {
-			Limit     int   `json:"limit"`
-			Remaining int   `json:"remaining"`
-			Used      int   `json:"used"`
-			Reset     int64 `json:"reset"`
-		} `json:"rate"`
-	}
-
-	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
-		return RateLimitState{}, fmt.Errorf("parse GitHub rate limit: %w", err)
-	}
-
-	return RateLimitState{
-		Limit:     response.Rate.Limit,
-		Remaining: response.Rate.Remaining,
-		Used:      response.Rate.Used,
-		ResetAt:   time.Unix(response.Rate.Reset, 0).UTC(),
-	}, nil
+func (r *RateLimiter) ShouldPoll(repoIndex int) bool {
+	return repoIndex == 0 || repoIndex%rateLimitPollEveryRepos == 0
 }

@@ -3,18 +3,21 @@ package analyzer
 import "time"
 
 type ProgressState struct {
-	Mode             string
-	Target           string
-	ResumeEnabled    bool
-	Workers          int
-	RateLimitFloor   int
-	TotalRepos       int
-	CompletedRepos   int
-	CachedRepos      int
-	RevalidatedRepos int
-	FailedRepos      int
-	ActiveWorkers    int
-	Phase            string
+	Mode                 string
+	Target               string
+	ResumeEnabled        bool
+	Workers              int
+	RateLimitFloor       int
+	RateLimitRemaining   int
+	RateLimitResetAt     time.Time
+	TotalRepos           int
+	CompletedRepos       int
+	CachedRepos          int
+	RevalidatedRepos     int
+	FailedRepos          int
+	ActiveWorkers        int
+	WorkerRecommendation int
+	Phase                string
 }
 
 type RateLimitState struct {

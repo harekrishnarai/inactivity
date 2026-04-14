@@ -1,25 +1,40 @@
 package analyzer
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 func RenderHeader(state ProgressState, width int, colorEnabled bool) string {
-	_ = width
-	_ = colorEnabled
+	title := "inactivity"
+	if colorEnabled {
+		title = "\x1b[36m" + title + "\x1b[0m"
+	}
 
-	line1 := fmt.Sprintf("inactivity | mode=%s | target=%s", state.Mode, state.Target)
+	if width < 72 {
+		return fmt.Sprintf("%s | mode=%s | target=%s | resume=%t workers=%d floor=%d",
+			title, state.Mode, state.Target, state.ResumeEnabled, state.Workers, state.RateLimitFloor)
+	}
+
+	line1 := fmt.Sprintf("%s | mode=%s | target=%s", title, state.Mode, state.Target)
 	line2 := fmt.Sprintf("resume=%t workers=%d floor=%d", state.ResumeEnabled, state.Workers, state.RateLimitFloor)
 	return line1 + "\n" + line2
 }
 
 func RenderProgressLine(state ProgressState) string {
-	return fmt.Sprintf(
-		"progress=%d/%d cached=%d revalidated=%d failed=%d workers=%d phase=%s",
+	line := fmt.Sprintf(
+		"progress=%d/%d cached=%d revalidated=%d failed=%d active=%d worker_target=%d",
 		state.CompletedRepos,
 		state.TotalRepos,
 		state.CachedRepos,
 		state.RevalidatedRepos,
 		state.FailedRepos,
 		state.ActiveWorkers,
-		state.Phase,
+		state.WorkerRecommendation,
 	)
+	line += fmt.Sprintf(" rate_remaining=%d", state.RateLimitRemaining)
+	if !state.RateLimitResetAt.IsZero() {
+		line += fmt.Sprintf(" rate_reset=%s", state.RateLimitResetAt.UTC().Format(time.RFC3339))
+	}
+	return line + fmt.Sprintf(" phase=%s", state.Phase)
 }

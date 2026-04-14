@@ -65,6 +65,14 @@ inactivity repo <org/repo-name> [options]
 inactivity list --file <path-to-repo-list> [options]
 ```
 
+Common organization examples:
+
+```bash
+inactivity org -org mycompany -resume
+inactivity org -org mycompany -workers 8 -rate-limit-floor 300
+inactivity org -org mycompany -refresh
+```
+
 ### Options
 
 - `--days <number>`: Maximum age of last commit in days (default: 180)

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -14,6 +15,8 @@ type Checkpoint struct {
 	Target     string                  `json:"target"`
 	StartedAt  time.Time               `json:"startedAt"`
 	UpdatedAt  time.Time               `json:"updatedAt"`
+	Discovered []string                `json:"discovered,omitempty"`
+	NextPage   int                     `json:"nextPage,omitempty"`
 	Pending    []string                `json:"pending"`
 	InProgress []string                `json:"inProgress"`
 	Completed  map[string]RepoSnapshot `json:"completed"`
@@ -96,6 +99,9 @@ func (s *CheckpointStore) LoadLatest(target string) (Checkpoint, error) {
 		if entry.IsDir() {
 			continue
 		}
+		if filepath.Ext(entry.Name()) == ".tmp" {
+			continue
+		}
 
 		info, err := entry.Info()
 		if err != nil {
@@ -146,26 +152,10 @@ func (s *CheckpointStore) targetDir(target string) string {
 }
 
 func resumePendingRepos(allRepos []string, checkpoint Checkpoint) []string {
-	completed := checkpoint.Completed
-	if completed == nil {
-		completed = map[string]RepoSnapshot{}
-	}
-
+	completed := completedSnapshotsByRepo(checkpoint.Completed)
 	pending := make([]string, 0, len(allRepos))
-	seen := make(map[string]struct{}, len(allRepos))
-	for _, repo := range checkpoint.Pending {
-		if _, ok := completed[repo]; ok {
-			continue
-		}
-		seen[repo] = struct{}{}
-	}
-
 	for _, repo := range allRepos {
 		if _, ok := completed[repo]; ok {
-			continue
-		}
-		if _, ok := seen[repo]; ok {
-			pending = append(pending, repo)
 			continue
 		}
 		pending = append(pending, repo)
@@ -179,9 +169,10 @@ func completedRepositories(checkpoint Checkpoint, allRepos []string) []Repositor
 		return nil
 	}
 
+	completed := completedSnapshotsByRepo(checkpoint.Completed)
 	results := make([]Repository, 0, len(checkpoint.Completed))
 	for _, repo := range allRepos {
-		snapshot, ok := checkpoint.Completed[repo]
+		snapshot, ok := completed[repo]
 		if !ok {
 			continue
 		}
@@ -196,12 +187,50 @@ func checkpointFailures(checkpoint Checkpoint, allRepos []string) map[string]str
 		return map[string]string{}
 	}
 
+	failures := failuresByRepo(checkpoint.Failed)
 	failed := make(map[string]string, len(checkpoint.Failed))
 	for _, repo := range allRepos {
-		if msg, ok := checkpoint.Failed[repo]; ok {
+		if msg, ok := failures[repo]; ok {
 			failed[repo] = msg
 		}
 	}
 
 	return failed
+}
+
+func completedSnapshotsByRepo(completed map[string]RepoSnapshot) map[string]RepoSnapshot {
+	if len(completed) == 0 {
+		return map[string]RepoSnapshot{}
+	}
+
+	normalized := make(map[string]RepoSnapshot, len(completed))
+	for key, snapshot := range completed {
+		repo := key
+		if snapshot.Repository != "" {
+			repo = snapshot.Repository
+		}
+		normalized[checkpointRepoName(repo)] = snapshot
+	}
+
+	return normalized
+}
+
+func failuresByRepo(failed map[string]string) map[string]string {
+	if len(failed) == 0 {
+		return map[string]string{}
+	}
+
+	normalized := make(map[string]string, len(failed))
+	for repo, msg := range failed {
+		normalized[checkpointRepoName(repo)] = msg
+	}
+
+	return normalized
+}
+
+func checkpointRepoName(repo string) string {
+	if _, name, ok := strings.Cut(repo, "/"); ok {
+		return name
+	}
+	return repo
 }
