@@ -167,11 +167,14 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 	var results []Repository
 	now := time.Now()
 	startTime := time.Now()
-
-	// Define color functions for progress bar if not in silent mode
-	var cyan func(...interface{}) string
-	if !cfg.Silent {
-		cyan = color.New(color.FgCyan).SprintFunc()
+	progressState := ProgressState{
+		Mode:           "org",
+		Target:         cfg.Organization,
+		ResumeEnabled:  cfg.Resume,
+		Workers:        cfg.Workers,
+		RateLimitFloor: cfg.RateLimitFloor,
+		TotalRepos:     len(allRepos),
+		Phase:          "scan",
 	}
 
 	// Create progress bar
@@ -202,8 +205,28 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		)
 	}
 
+	advanceProgress := func(i int) {
+		if cfg.Silent || bar == nil {
+			return
+		}
+
+		elapsed := time.Since(startTime)
+		timePerRepo := time.Duration(0)
+		if i+1 > 0 {
+			timePerRepo = elapsed / time.Duration(i+1)
+		}
+		remaining := timePerRepo * time.Duration(len(allRepos)-i-1)
+
+		bar.Describe(fmt.Sprintf("%s [%s elapsed, %s remaining]",
+			RenderProgressLine(progressState), formatDuration(elapsed), formatDuration(remaining)))
+		_ = bar.Add(1)
+	}
+
 	// Analyze each repository
 	for i, repo := range allRepos {
+		progressState.CompletedRepos = i + 1
+		progressState.ActiveWorkers = cfg.Workers
+
 		repoFullName := fmt.Sprintf("%s/%s", cfg.Organization, repo.Name)
 		r := Repository{
 			Name: repoFullName,
@@ -214,6 +237,8 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 			if !cfg.Silent {
 				fmt.Printf("⚠️ Warning: Failed to check if repository is archived for %s: %v\n", repoFullName, err)
 			}
+			progressState.FailedRepos++
+			advanceProgress(i)
 			continue
 		}
 		r.Archived = isArchived
@@ -224,6 +249,8 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 			if !cfg.Silent {
 				fmt.Printf("⚠️ Warning: Failed to get last commit date for %s: %v\n", repoFullName, err)
 			}
+			progressState.FailedRepos++
+			advanceProgress(i)
 			continue
 		}
 		r.LastCommitDate = lastCommitDate
@@ -235,6 +262,8 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 			if !cfg.Silent {
 				fmt.Printf("⚠️ Warning: Failed to analyze contributors for %s: %v\n", repoFullName, err)
 			}
+			progressState.FailedRepos++
+			advanceProgress(i)
 			continue
 		}
 
@@ -270,22 +299,7 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		}
 
 		results = append(results, r)
-
-		// Update progress bar with elapsed time information
-		if !cfg.Silent && bar != nil {
-			elapsed := time.Since(startTime)
-			timePerRepo := time.Duration(0)
-			if i+1 > 0 {
-				timePerRepo = elapsed / time.Duration(i+1)
-			}
-			remaining := timePerRepo * time.Duration(len(allRepos)-i-1)
-
-			percentDone := float64(i+1) / float64(len(allRepos)) * 100
-			// Apply color to the progress bar description string
-			bar.Describe(fmt.Sprintf("%s [%.1f%%] [%s elapsed, %s remaining]",
-				cyan("⚡ Analyzing repositories"), percentDone, formatDuration(elapsed), formatDuration(remaining)))
-			_ = bar.Add(1) // Use _ = to ignore error return value
-		}
+		advanceProgress(i)
 	}
 
 	return results, nil
