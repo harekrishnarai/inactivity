@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -24,53 +25,20 @@ func Main() {
 		os.Exit(1)
 	}
 
-	// Initialize config with defaults
-	cfg := config.Config{
-		MaxCommitAgeInDays:       180,
-		InactiveContribThreshold: 0.5,
-		OutputFormat:             "console",
-	}
-
-	// Define common flags for all commands
+	cfg := config.Default()
 	commonFlags := flag.NewFlagSet("common", flag.ExitOnError)
-	commonFlags.IntVar(&cfg.MaxCommitAgeInDays, "days", 180, "Maximum age of last commit in days")
-	commonFlags.Float64Var(&cfg.InactiveContribThreshold, "threshold", 0.5, "Threshold of inactive contributors (0.0-1.0)")
-	commonFlags.StringVar(&cfg.OutputFormat, "format", "console", "Output format: console, json, or csv")
+	commonFlags.IntVar(&cfg.MaxCommitAgeInDays, "days", cfg.MaxCommitAgeInDays, "Maximum age of last commit in days")
+	commonFlags.Float64Var(&cfg.InactiveContribThreshold, "threshold", cfg.InactiveContribThreshold, "Threshold of inactive contributors (0.0-1.0)")
+	commonFlags.StringVar(&cfg.OutputFormat, "format", cfg.OutputFormat, "Output format: console, json, or csv")
 	commonFlags.StringVar(&cfg.OutputFile, "output", "", "Output file path (optional)")
-	commonFlags.BoolVar(&cfg.Silent, "silent", false, "Suppress banner and progress output") // Process command
+	commonFlags.BoolVar(&cfg.Silent, "silent", false, "Suppress banner and progress output")
+
 	switch os.Args[1] {
 	case "org":
-		// The original functionality: analyze an organization's repositories
-		orgCmd := flag.NewFlagSet("org", flag.ExitOnError)
-		orgCmd.StringVar(&cfg.Organization, "org", "", "GitHub organization to analyze")
-
-		// Add common flags to org command
-		orgCmd.IntVar(&cfg.MaxCommitAgeInDays, "days", 180, "Maximum age of last commit in days")
-		orgCmd.Float64Var(&cfg.InactiveContribThreshold, "threshold", 0.5, "Threshold of inactive contributors (0.0-1.0)")
-		orgCmd.StringVar(&cfg.OutputFormat, "format", "console", "Output format: console, json, or csv")
-		orgCmd.StringVar(&cfg.OutputFile, "output", "", "Output file path (optional)")
-		orgCmd.BoolVar(&cfg.Silent, "silent", false, "Suppress banner and progress output") // Parse org command flags only once
-		if err := orgCmd.Parse(os.Args[2:]); err != nil {
+		cfg, err := parseOrgArgs(os.Args[2:])
+		if err != nil {
 			log.Fatalf("❌ Failed to parse org command flags: %v", err)
 		}
-		// Check for positional arguments
-		if orgCmd.NArg() > 0 {
-			// First positional argument could be the format
-			if orgCmd.NArg() >= 1 {
-				if orgCmd.Arg(0) == "json" || orgCmd.Arg(0) == "csv" || orgCmd.Arg(0) == "console" {
-					cfg.OutputFormat = orgCmd.Arg(0)
-				}
-			}
-
-			// Check for output as a separate positional argument
-			for i := 0; i < orgCmd.NArg(); i++ {
-				if orgCmd.Arg(i) == "-output" && i+1 < orgCmd.NArg() {
-					cfg.OutputFile = orgCmd.Arg(i + 1)
-					break
-				}
-			}
-		}
-
 		// Run the organization analysis
 		analyzeOrganization(cfg)
 
@@ -175,6 +143,45 @@ func Main() {
 		displayUsage()
 		os.Exit(1)
 	}
+}
+
+func parseOrgArgs(args []string) (config.Config, error) {
+	cfg := config.Default()
+
+	orgCmd := flag.NewFlagSet("org", flag.ContinueOnError)
+	orgCmd.SetOutput(io.Discard)
+
+	orgCmd.StringVar(&cfg.Organization, "org", "", "GitHub organization to analyze")
+	orgCmd.IntVar(&cfg.MaxCommitAgeInDays, "days", cfg.MaxCommitAgeInDays, "Maximum age of last commit in days")
+	orgCmd.Float64Var(&cfg.InactiveContribThreshold, "threshold", cfg.InactiveContribThreshold, "Threshold of inactive contributors (0.0-1.0)")
+	orgCmd.StringVar(&cfg.OutputFormat, "format", cfg.OutputFormat, "Output format: console, json, or csv")
+	orgCmd.StringVar(&cfg.OutputFile, "output", "", "Output file path (optional)")
+	orgCmd.BoolVar(&cfg.Silent, "silent", false, "Suppress banner and progress output")
+	orgCmd.BoolVar(&cfg.Resume, "resume", false, "Resume from the latest checkpoint for this org scan")
+	orgCmd.BoolVar(&cfg.Refresh, "refresh", false, "Ignore cached repo and membership data")
+	orgCmd.IntVar(&cfg.Workers, "workers", cfg.Workers, "Maximum concurrent repository workers")
+	orgCmd.IntVar(&cfg.RateLimitFloor, "rate-limit-floor", cfg.RateLimitFloor, "Pause the scan when the remaining GitHub API budget reaches this floor")
+	orgCmd.StringVar(&cfg.CacheDir, "cache-dir", cfg.CacheDir, "Directory used for local cache files")
+	orgCmd.StringVar(&cfg.CheckpointDir, "checkpoint-dir", cfg.CheckpointDir, "Directory used for resumable checkpoint files")
+
+	if err := orgCmd.Parse(args); err != nil {
+		return config.Config{}, err
+	}
+
+	if orgCmd.NArg() > 0 {
+		if arg := orgCmd.Arg(0); arg == "json" || arg == "csv" || arg == "console" {
+			cfg.OutputFormat = arg
+		}
+
+		for i := 0; i < orgCmd.NArg(); i++ {
+			if orgCmd.Arg(i) == "-output" && i+1 < orgCmd.NArg() {
+				cfg.OutputFile = orgCmd.Arg(i + 1)
+				break
+			}
+		}
+	}
+
+	return cfg, nil
 }
 
 // displayUsage shows the usage information for the tool
