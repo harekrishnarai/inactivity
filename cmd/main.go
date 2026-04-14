@@ -176,7 +176,7 @@ func parseOrgArgs(args []string) (config.Config, error) {
 			cfg.OutputFormat = arg
 		} else if cfg.Organization == "" {
 			// Treat the first positional arg as the org name when not a known format specifier.
-			// This supports: inactivity org meltwater --resume
+			// This supports: inactivity org mycompany --resume
 			cfg.Organization = arg
 		}
 
