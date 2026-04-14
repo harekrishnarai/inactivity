@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fatih/color"
@@ -34,6 +36,25 @@ type Repository struct {
 	InactivePercentage   float64   `json:"inactivePercentage"`
 	Archived             bool      `json:"archived"`
 	Flagged              bool      `json:"flagged"`
+}
+
+// scanResult holds the outcome of processing a single repository.
+type scanResult struct {
+	repoFullName string
+	repo         *Repository
+	snapshot     *RepoSnapshot
+	fromCache    bool
+	failed       bool
+	failedMsg    string
+	interrupted  bool
+}
+
+// rateLimitDisplayInfo carries rate-limit state from the dispatch loop to the collector.
+type rateLimitDisplayInfo struct {
+	remaining     int
+	resetAt       time.Time
+	activeWorkers int
+	recommended   int
 }
 
 // ValidateGitHubCLI checks if GitHub CLI is installed and authenticated
@@ -117,6 +138,105 @@ func DisplayBanner(silent bool, showOrgBanner bool) {
 	}
 }
 
+// processOneRepo analyzes a single repository and returns a scanResult.
+// It is safe to call concurrently from multiple goroutines.
+func processOneRepo(ctx context.Context, client GitHubClient, cfg config.Config, cache *CacheStore, repoFullName string, now time.Time) scanResult {
+	res := scanResult{repoFullName: repoFullName}
+
+	if !cfg.Refresh {
+		snapshot, ok, err := cache.GetRepo(repoFullName, now)
+		if err == nil && ok {
+			res.fromCache = true
+			r := repositoryFromSnapshot(snapshot)
+			res.repo = &r
+			s := snapshot
+			res.snapshot = &s
+			return res
+		}
+	}
+
+	r := Repository{Name: repoFullName}
+
+	isArchived, err := isRepositoryArchived(ctx, client, repoFullName)
+	if err != nil {
+		if interrupted(ctx, err) {
+			res.interrupted = true
+			return res
+		}
+		res.failed = true
+		res.failedMsg = err.Error()
+		return res
+	}
+	r.Archived = isArchived
+
+	lastCommitDate, err := getLastCommitDate(ctx, client, repoFullName)
+	if err != nil {
+		if interrupted(ctx, err) {
+			res.interrupted = true
+			return res
+		}
+		res.failed = true
+		res.failedMsg = err.Error()
+		return res
+	}
+	r.LastCommitDate = lastCommitDate
+	r.DaysSinceLastCommit = int(now.Sub(lastCommitDate).Hours() / 24)
+
+	activeContribs, inactiveContribs, err := getContributorsStatusWithCache(ctx, client, repoFullName, cfg.Organization, cache, now, cfg.Refresh)
+	if err != nil {
+		if interrupted(ctx, err) {
+			res.interrupted = true
+			return res
+		}
+		res.failed = true
+		res.failedMsg = err.Error()
+		return res
+	}
+
+	r.TotalContributors = activeContribs + inactiveContribs
+	r.InactiveContributors = inactiveContribs
+	if r.TotalContributors > 0 {
+		r.InactivePercentage = float64(inactiveContribs) / float64(r.TotalContributors)
+	}
+
+	if r.Archived {
+		r.Flagged = true
+	} else {
+		isOld := r.DaysSinceLastCommit > cfg.MaxCommitAgeInDays
+		if isOld {
+			if r.TotalContributors > 0 {
+				if r.InactivePercentage >= cfg.InactiveContribThreshold {
+					r.Flagged = true
+				}
+			} else {
+				r.Flagged = true
+			}
+		}
+	}
+
+	snap := repoSnapshotFromRepository(r, now)
+	res.repo = &r
+	res.snapshot = &snap
+	return res
+}
+
+// remainingPending returns repo names from pendingRepos that are not yet completed or failed.
+func remainingPending(org string, pendingRepos []string, checkpoint Checkpoint) []string {
+	completed := completedSnapshotsByRepo(checkpoint.Completed)
+	remaining := make([]string, 0, len(pendingRepos))
+	for _, name := range pendingRepos {
+		if _, done := completed[name]; done {
+			continue
+		}
+		full := fmt.Sprintf("%s/%s", org, name)
+		if _, failed := checkpoint.Failed[full]; failed {
+			continue
+		}
+		remaining = append(remaining, name)
+	}
+	return remaining
+}
+
 // AnalyzeRepositories analyzes all repositories in the given organization
 func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -158,13 +278,13 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 			if currentCheckpoint.RunID == "" {
 				currentCheckpoint.RunID = fmt.Sprintf("run-%d", now.UTC().UnixNano())
 			}
-				if currentCheckpoint.StartedAt.IsZero() {
-					currentCheckpoint.StartedAt = now.UTC()
-				}
-				currentCheckpoint.Target = cfg.Organization
-				currentCheckpoint.InProgress = nil
-				if currentCheckpoint.Completed == nil {
-					currentCheckpoint.Completed = map[string]RepoSnapshot{}
+			if currentCheckpoint.StartedAt.IsZero() {
+				currentCheckpoint.StartedAt = now.UTC()
+			}
+			currentCheckpoint.Target = cfg.Organization
+			currentCheckpoint.InProgress = nil
+			if currentCheckpoint.Completed == nil {
+				currentCheckpoint.Completed = map[string]RepoSnapshot{}
 			}
 			if currentCheckpoint.Failed == nil {
 				currentCheckpoint.Failed = map[string]string{}
@@ -198,7 +318,40 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 	if resumeScanState && len(currentCheckpoint.Discovered) > 0 {
 		allRepos = append([]string(nil), currentCheckpoint.Discovered...)
 	} else {
-		allRepos, err = loadOrganizationReposWithCheckpoint(ctx, client, cfg.Organization, checkpointStore, &currentCheckpoint, &progressState)
+		var onEnumerateProgress func(int)
+		var stopSpinner func()
+
+		if !cfg.Silent {
+			var discovered atomic.Int64
+			spinnerDone := make(chan struct{})
+
+			onEnumerateProgress = func(n int) { discovered.Store(int64(n)) }
+
+			frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+			go func() {
+				ticker := time.NewTicker(80 * time.Millisecond)
+				defer ticker.Stop()
+				for i := 0; ; i++ {
+					select {
+					case <-spinnerDone:
+						return
+					case <-ticker.C:
+						fmt.Printf("\r%s Enumerating repositories... %d found",
+							frames[i%len(frames)], discovered.Load())
+					}
+				}
+			}()
+
+			stopSpinner = func() {
+				close(spinnerDone)
+				fmt.Println() // move past the spinner line
+			}
+		}
+
+		allRepos, err = loadOrganizationReposWithCheckpoint(ctx, client, cfg.Organization, checkpointStore, &currentCheckpoint, &progressState, onEnumerateProgress)
+		if stopSpinner != nil {
+			stopSpinner()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -229,9 +382,8 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 	// Create progress bar
 	var bar *progressbar.ProgressBar
 	if !cfg.Silent {
-		// Create a colorful progress bar like popular scanner tools
 		bar = progressbar.NewOptions(len(allRepos),
-			progressbar.OptionEnableColorCodes(false), // Set to false if using custom color functions for description
+			progressbar.OptionEnableColorCodes(false),
 			progressbar.OptionSetDescription("⚡ Analyzing repositories"),
 			progressbar.OptionSetTheme(progressbar.Theme{
 				Saucer:        "█",
@@ -270,25 +422,92 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 		if i+1 > 0 {
 			timePerRepo = elapsed / time.Duration(i+1)
 		}
-		remaining := timePerRepo * time.Duration(len(allRepos)-i-1)
+		// Use pendingRepos length for accurate ETA (avoids overcounting already-completed repos on resume)
+		remaining := timePerRepo * time.Duration(len(pendingRepos)-i-1)
 
 		bar.Describe(fmt.Sprintf("%s [%s elapsed, %s remaining]",
 			RenderProgressLine(progressState), formatDuration(elapsed), formatDuration(remaining)))
 		_ = bar.Add(1)
 	}
 
-	// Analyze each repository
-	for i, repoName := range pendingRepos {
-		select {
-		case <-ctx.Done():
-			if err := saveCheckpoint(true); err != nil {
-				return nil, err
+	// Concurrent scan using a worker pool.
+	numWorkers := cfg.Workers
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	progressState.ActiveWorkers = numWorkers
+	progressState.WorkerRecommendation = numWorkers
+
+	// sem limits the number of in-flight workers.
+	sem := make(chan struct{}, numWorkers)
+	// resultCh carries completed work back to the collector.
+	// Buffer size numWorkers+2 ensures workers never block on send while a slot is available.
+	resultCh := make(chan scanResult, numWorkers+2)
+	var wg sync.WaitGroup
+
+	// rateLimitCh passes rate-limit display updates from the dispatch loop to the collector.
+	// Non-blocking sends mean the dispatch loop never stalls on this.
+	rateLimitCh := make(chan rateLimitDisplayInfo, 1)
+
+	// Collector goroutine: sole writer to shared state (results, progressState, currentCheckpoint).
+	collectorDone := make(chan struct{})
+	collected := 0
+	go func() {
+		defer close(collectorDone)
+		for result := range resultCh {
+			// Apply any pending rate-limit display update (non-blocking drain).
+			select {
+			case info := <-rateLimitCh:
+				progressState.RateLimitRemaining = info.remaining
+				progressState.RateLimitResetAt = info.resetAt
+				progressState.ActiveWorkers = info.activeWorkers
+				progressState.WorkerRecommendation = info.recommended
+			default:
 			}
-			return results, ErrGracefulStop
-		default:
+
+			if result.interrupted {
+				cancel()
+				continue
+			}
+
+			repoFull := result.repoFullName
+			if result.fromCache {
+				progressState.CachedRepos++
+				results = append(results, *result.repo)
+				currentCheckpoint.Completed[repoFull] = *result.snapshot
+				delete(currentCheckpoint.Failed, repoFull)
+			} else if result.failed {
+				if !cfg.Silent {
+					fmt.Printf("⚠️ Warning: Failed to analyze %s: %s\n", repoFull, result.failedMsg)
+				}
+				progressState.FailedRepos++
+				currentCheckpoint.Failed[repoFull] = result.failedMsg
+			} else if result.repo != nil {
+				results = append(results, *result.repo)
+				currentCheckpoint.Completed[repoFull] = *result.snapshot
+				delete(currentCheckpoint.Failed, repoFull)
+				if cacheErr := cache.PutRepo(*result.snapshot); cacheErr != nil && !cfg.Silent {
+					fmt.Printf("⚠️ Warning: Failed to store repo cache for %s: %v\n", repoFull, cacheErr)
+				}
+			}
+			currentCheckpoint.InProgress = nil
+			progressState.CompletedRepos = len(results)
+			if saveErr := saveCheckpoint(false); saveErr != nil && !cfg.Silent {
+				fmt.Printf("⚠️ Warning: %v\n", saveErr)
+			}
+			collected++
+			advanceProgress(collected - 1)
+		}
+	}()
+
+	// Dispatch loop: sends jobs to workers, handles rate limiting.
+	pauseErr := error(nil)
+	for i, repoName := range pendingRepos {
+		if ctx.Err() != nil {
+			break
 		}
 
-		progressState.CompletedRepos = len(results)
 		if rateLimiter.ShouldPoll(i) {
 			if state, err := client.GetRateLimitState(ctx); err == nil {
 				rateLimiter.Update(state)
@@ -296,178 +515,91 @@ func AnalyzeRepositories(cfg config.Config) ([]Repository, error) {
 				rateLimiter.UseLastKnownOrFallback()
 			}
 		}
+
 		if rateLimiter.HasState() {
-			progressState.WorkerRecommendation = rateLimiter.RecommendedWorkers(cfg.Workers)
-			progressState.ActiveWorkers = 1
-			if progressState.WorkerRecommendation == 0 {
+			rec := rateLimiter.RecommendedWorkers(numWorkers)
+			active := numWorkers
+			if rec == 0 {
+				active = 0
+			}
+			// Communicate rate-limit info to the collector (non-blocking; stale display is acceptable).
+			select {
+			case rateLimitCh <- rateLimitDisplayInfo{
+				remaining:     rateLimiter.state.Remaining,
+				resetAt:       rateLimiter.state.ResetAt,
+				activeWorkers: active,
+				recommended:   rec,
+			}:
+			default:
+			}
+			if rateLimiter.ShouldPause() {
+				pauseErr = ErrRateLimitPause
+				break
+			}
+		}
+
+		repoFull := fmt.Sprintf("%s/%s", cfg.Organization, repoName)
+
+		sem <- struct{}{} // acquire a worker slot (blocks when all workers are busy)
+		if ctx.Err() != nil {
+			<-sem
+			break
+		}
+
+		wg.Add(1)
+		go func(repoFull string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			result := processOneRepo(ctx, client, cfg, cache, repoFull, now)
+			select {
+			case resultCh <- result:
+			case <-ctx.Done():
+			}
+		}(repoFull)
+	}
+
+	// Wait for all in-flight workers to complete, then signal the collector to stop.
+	wg.Wait()
+	close(resultCh)
+	<-collectorDone
+
+	// After all goroutines have finished, shared state is safe to access without locks.
+
+	if ctx.Err() != nil {
+		currentCheckpoint.Pending = remainingPending(cfg.Organization, pendingRepos, currentCheckpoint)
+		currentCheckpoint.InProgress = nil
+		currentCheckpoint.Progress = progressState
+		if err := saveCheckpoint(true); err != nil {
+			return nil, err
+		}
+		return results, ErrGracefulStop
+	}
+
+	if pauseErr != nil {
+		// All goroutines have finished; apply the final rate-limit state to progressState.
+		if rateLimiter.HasState() {
+			rec := rateLimiter.RecommendedWorkers(numWorkers)
+			progressState.WorkerRecommendation = rec
+			progressState.ActiveWorkers = numWorkers
+			if rec == 0 {
 				progressState.ActiveWorkers = 0
 			}
 			progressState.RateLimitRemaining = rateLimiter.state.Remaining
 			progressState.RateLimitResetAt = rateLimiter.state.ResetAt
-			currentCheckpoint.Progress = progressState
-			if rateLimiter.ShouldPause() {
-				currentCheckpoint.InProgress = nil
-				currentCheckpoint.Pending = append([]string(nil), pendingRepos[i:]...)
-				currentCheckpoint.Progress = progressState
-				if err := checkpointStore.Save(currentCheckpoint); err != nil {
-					return nil, fmt.Errorf("save checkpoint before rate limit pause: %w", err)
-				}
-				return results, ErrRateLimitPause
-			}
-		} else {
-			progressState.ActiveWorkers = 1
-			progressState.WorkerRecommendation = cfg.Workers
-			progressState.RateLimitRemaining = 0
-			progressState.RateLimitResetAt = time.Time{}
 		}
-
-		repoFullName := fmt.Sprintf("%s/%s", cfg.Organization, repoName)
-		currentCheckpoint.InProgress = []string{repoFullName}
-		currentCheckpoint.Pending = append([]string(nil), pendingRepos[i+1:]...)
-		if err := saveCheckpoint(false); err != nil {
-			return nil, err
-		}
-
-		if !cfg.Refresh {
-			snapshot, ok, err := cache.GetRepo(repoFullName, now)
-			if err != nil {
-				return nil, fmt.Errorf("get repo cache: %w", err)
-			}
-			if ok {
-				progressState.CachedRepos++
-				repo := repositoryFromSnapshot(snapshot)
-				results = append(results, repo)
-				currentCheckpoint.Completed[repoFullName] = snapshot
-				delete(currentCheckpoint.Failed, repoFullName)
-				currentCheckpoint.InProgress = nil
-				progressState.CompletedRepos = len(results)
-				if err := saveCheckpoint(false); err != nil {
-					return nil, err
-				}
-				advanceProgress(i)
-				continue
-			}
-		}
-
-		r := Repository{Name: repoFullName}
-		// Check if repository is archived
-		isArchived, err := isRepositoryArchived(ctx, client, repoFullName)
-		if err != nil {
-			if interrupted(ctx, err) {
-				if err := saveCheckpoint(true); err != nil {
-					return nil, err
-				}
-				return results, ErrGracefulStop
-			}
-			if !cfg.Silent {
-				fmt.Printf("⚠️ Warning: Failed to check if repository is archived for %s: %v\n", repoFullName, err)
-			}
-			progressState.FailedRepos++
-			currentCheckpoint.Failed[repoFullName] = err.Error()
-			currentCheckpoint.InProgress = nil
-			if err := saveCheckpoint(false); err != nil {
-				return nil, err
-			}
-			advanceProgress(i)
-			continue
-		}
-		r.Archived = isArchived
-
-		// Get last commit date
-		lastCommitDate, err := getLastCommitDate(ctx, client, repoFullName)
-		if err != nil {
-			if interrupted(ctx, err) {
-				if err := saveCheckpoint(true); err != nil {
-					return nil, err
-				}
-				return results, ErrGracefulStop
-			}
-			if !cfg.Silent {
-				fmt.Printf("⚠️ Warning: Failed to get last commit date for %s: %v\n", repoFullName, err)
-			}
-			progressState.FailedRepos++
-			currentCheckpoint.Failed[repoFullName] = err.Error()
-			currentCheckpoint.InProgress = nil
-			if err := saveCheckpoint(false); err != nil {
-				return nil, err
-			}
-			advanceProgress(i)
-			continue
-		}
-		r.LastCommitDate = lastCommitDate
-		r.DaysSinceLastCommit = int(now.Sub(lastCommitDate).Hours() / 24)
-
-		// Get contributors and check if they are still in the organization
-		activeContribs, inactiveContribs, err := getContributorsStatusWithCache(ctx, client, repoFullName, cfg.Organization, cache, now, cfg.Refresh)
-		if err != nil {
-			if interrupted(ctx, err) {
-				if err := saveCheckpoint(true); err != nil {
-					return nil, err
-				}
-				return results, ErrGracefulStop
-			}
-			if !cfg.Silent {
-				fmt.Printf("⚠️ Warning: Failed to analyze contributors for %s: %v\n", repoFullName, err)
-			}
-			progressState.FailedRepos++
-			currentCheckpoint.Failed[repoFullName] = err.Error()
-			currentCheckpoint.InProgress = nil
-			if err := saveCheckpoint(false); err != nil {
-				return nil, err
-			}
-			advanceProgress(i)
-			continue
-		}
-
-		r.TotalContributors = activeContribs + inactiveContribs
-		r.InactiveContributors = inactiveContribs
-
-		if r.TotalContributors > 0 {
-			r.InactivePercentage = float64(inactiveContribs) / float64(r.TotalContributors)
-		}
-
-		// Flag repository based on criteria
-		// 1. Repositories are flagged if they are archived
-		// 2. Repositories are flagged if they meet the age and inactive contributor criteria
-
-		// Always flag archived repositories
-		if r.Archived {
-			r.Flagged = true
-		} else {
-			// For non-archived repos, check age and contributor criteria
-			isOld := r.DaysSinceLastCommit > cfg.MaxCommitAgeInDays
-
-			if isOld {
-				if r.TotalContributors > 0 {
-					// If there are contributors, flag if the inactive percentage meets the threshold
-					if r.InactivePercentage >= cfg.InactiveContribThreshold {
-						r.Flagged = true
-					}
-				} else {
-					// If there are no contributors, flag it simply for being old
-					r.Flagged = true
-				}
-			}
-		}
-
-		results = append(results, r)
-		currentCheckpoint.Completed[repoFullName] = repoSnapshotFromRepository(r, now)
-		delete(currentCheckpoint.Failed, repoFullName)
+		currentCheckpoint.Pending = remainingPending(cfg.Organization, pendingRepos, currentCheckpoint)
 		currentCheckpoint.InProgress = nil
-		progressState.CompletedRepos = len(results)
-		if err := cache.PutRepo(repoSnapshotFromRepository(r, now)); err != nil && !cfg.Silent {
-			fmt.Printf("⚠️ Warning: Failed to store repo cache for %s: %v\n", repoFullName, err)
+		currentCheckpoint.Progress = progressState
+		if err := checkpointStore.Save(currentCheckpoint); err != nil {
+			return nil, fmt.Errorf("save checkpoint before rate limit pause: %w", err)
 		}
-		if err := saveCheckpoint(false); err != nil {
-			return nil, err
-		}
-		advanceProgress(i)
+		return results, pauseErr
 	}
 
 	return results, nil
 }
 
-func loadOrganizationReposWithCheckpoint(ctx context.Context, client GitHubClient, org string, checkpointStore *CheckpointStore, checkpoint *Checkpoint, progressState *ProgressState) ([]string, error) {
+func loadOrganizationReposWithCheckpoint(ctx context.Context, client GitHubClient, org string, checkpointStore *CheckpointStore, checkpoint *Checkpoint, progressState *ProgressState, onProgress func(discovered int)) ([]string, error) {
 	allRepos := append([]string(nil), checkpoint.Discovered...)
 	startPage := checkpoint.NextPage
 	if startPage < 1 {
@@ -495,6 +627,9 @@ func loadOrganizationReposWithCheckpoint(ctx context.Context, client GitHubClien
 		progressState.TotalRepos = len(allRepos)
 		progressState.Phase = "enumerate"
 		checkpoint.Progress = *progressState
+		if onProgress != nil {
+			onProgress(len(allRepos))
+		}
 		if err := checkpointStore.Save(*checkpoint); err != nil {
 			return nil, fmt.Errorf("save checkpoint during repository enumeration: %w", err)
 		}

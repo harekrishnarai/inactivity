@@ -82,6 +82,70 @@ func (s *CheckpointStore) Save(checkpoint Checkpoint) error {
 	return nil
 }
 
+// LoadLatestTarget scans the checkpoint root directory and returns the Target field
+// from the most recently modified checkpoint file across all organizations.
+// Use this to auto-detect which org to resume when none is specified.
+func (s *CheckpointStore) LoadLatestTarget() (string, error) {
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return "", err
+	}
+
+	type candidate struct {
+		path    string
+		modTime time.Time
+	}
+
+	var candidates []candidate
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dirPath := filepath.Join(s.root, entry.Name())
+		files, err := os.ReadDir(dirPath)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.IsDir() || filepath.Ext(f.Name()) == ".tmp" {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			candidates = append(candidates, candidate{
+				path:    filepath.Join(dirPath, f.Name()),
+				modTime: info.ModTime(),
+			})
+		}
+	}
+
+	if len(candidates) == 0 {
+		return "", os.ErrNotExist
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].modTime.After(candidates[j].modTime)
+	})
+
+	for _, c := range candidates {
+		data, err := os.ReadFile(c.path)
+		if err != nil {
+			continue
+		}
+		var checkpoint Checkpoint
+		if err := json.Unmarshal(data, &checkpoint); err != nil {
+			continue
+		}
+		if checkpoint.Target != "" {
+			return checkpoint.Target, nil
+		}
+	}
+
+	return "", os.ErrNotExist
+}
+
 func (s *CheckpointStore) LoadLatest(target string) (Checkpoint, error) {
 	dir := s.targetDir(target)
 	entries, err := os.ReadDir(dir)
