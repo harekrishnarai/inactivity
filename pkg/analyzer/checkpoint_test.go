@@ -161,7 +161,7 @@ func TestLoadOrganizationReposWithCheckpointPersistsEnumerationStateOnGracefulSt
 		},
 	}
 
-	_, err := loadOrganizationReposWithCheckpoint(ctx, client, "acme", store, &checkpoint, &progress)
+	_, err := loadOrganizationReposWithCheckpoint(ctx, client, "acme", store, &checkpoint, &progress, nil)
 	if !errors.Is(err, ErrGracefulStop) {
 		t.Fatalf("loadOrganizationReposWithCheckpoint error = %v, want %v", err, ErrGracefulStop)
 	}
@@ -208,7 +208,7 @@ func TestLoadOrganizationReposWithCheckpointResumesFromSavedPage(t *testing.T) {
 		},
 	}
 
-	repos, err := loadOrganizationReposWithCheckpoint(context.Background(), client, "acme", store, &checkpoint, &progress)
+	repos, err := loadOrganizationReposWithCheckpoint(context.Background(), client, "acme", store, &checkpoint, &progress, nil)
 	if err != nil {
 		t.Fatalf("loadOrganizationReposWithCheckpoint returned error: %v", err)
 	}

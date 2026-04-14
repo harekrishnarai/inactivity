@@ -17,7 +17,7 @@ import (
 	"github.com/harekrishnarai/inactivity/pkg/config"
 )
 
-const Version = "v0.2.2"
+const Version = "v0.3.0"
 
 // Main is the entry point for the application
 // It's exported so it can be called from the root package
@@ -174,6 +174,10 @@ func parseOrgArgs(args []string) (config.Config, error) {
 	if orgCmd.NArg() > 0 {
 		if arg := orgCmd.Arg(0); arg == "json" || arg == "csv" || arg == "console" {
 			cfg.OutputFormat = arg
+		} else if cfg.Organization == "" {
+			// Treat the first positional arg as the org name when not a known format specifier.
+			// This supports: inactivity org meltwater --resume
+			cfg.Organization = arg
 		}
 
 		for i := 0; i < orgCmd.NArg(); i++ {
@@ -258,6 +262,17 @@ func analyzeOrganization(cfg config.Config) {
 	// Validate GitHub CLI installation
 	if err := analyzer.ValidateGitHubCLI(); err != nil {
 		log.Fatalf("❌ GitHub CLI validation failed: %v", err)
+	}
+
+	// When resuming without an explicit org, try to auto-detect from the latest checkpoint.
+	if cfg.Resume && cfg.Organization == "" {
+		cs := analyzer.NewCheckpointStore(cfg.CheckpointDir)
+		if target, err := cs.LoadLatestTarget(); err == nil && target != "" {
+			cfg.Organization = target
+			if !cfg.Silent {
+				fmt.Printf("🔄 Resuming latest scan for: %s\n", cfg.Organization)
+			}
+		}
 	}
 
 	// Get available organizations
